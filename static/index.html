@@ -2536,7 +2536,7 @@ async function openImport() {
 
 /* ---------- 导入队列（在页面里依次处理；关闭页面后可在话题里点“继续”） ---------- */
 const mediaFiles = new Map();   // 导入记录 id → 本地文件（只在本次页面有效）
-const mediaJobs = new Map();    // 导入记录 id → 服务器上的音频任务 id
+const mediaJobs = new Map();    // 导入记录 id → 服务器上的音频任务 { id, key }（key 是任务凭证）
 const mediaQueue = [];
 const mediaState = new Map();   // 导入记录 id → { msg, pct }
 let mediaCur = null, mediaAC = null, wakeLock = null;
@@ -2584,28 +2584,38 @@ const chk = (signal) => { if (signal.aborted) throw new Stopped(); };
 const sleepMs = (ms, signal) => new Promise((res, rej) => { const t = setTimeout(res, ms); signal.addEventListener('abort', () => { clearTimeout(t); rej(new Stopped()); }, { once: true }); });
 
 async function ensureServerJob(src, signal) {
-  let jid = mediaJobs.get(src.id);
-  if (jid) {
-    try { const st = await backend(`/api/media/jobs/${jid}`); if (st.state !== 'error') return jid; } catch { /* 任务过期，重新准备 */ }
+  let job = mediaJobs.get(src.id);
+  if (job) {
+    try { const st = await jobGet(job, ''); if (st.state !== 'error') return job; } catch { /* 任务过期，重新准备 */ }
     mediaJobs.delete(src.id);
   }
+  let jid;
   const r = src.ref || {};
   if (src.kind === 'bili') {
     mediaProgress(src.id, '请求 B 站音频…');
-    jid = (await backend('/api/media/jobs', { method: 'POST', body: JSON.stringify({ bvid: r.bvid, cid: r.cid, title: src.title, start_s: r.start_s || 0, end_s: r.end_s || null }) })).id;
+    jid = await backend('/api/media/jobs', { method: 'POST', body: JSON.stringify({ bvid: r.bvid, cid: r.cid, title: src.title, start_s: r.start_s || 0, end_s: r.end_s || null }) });
   } else {
     const f = mediaFiles.get(src.id);
     if (!f) throw new Error('需要重新选择本地文件：点「继续」并选择同一个文件');
-    jid = (await uploadWithProgress(f, r.start_s, r.end_s, (p) => mediaProgress(src.id, `上传文件… ${p}%`, p))).id;
+    jid = await uploadWithProgress(f, r.start_s, r.end_s, (p) => mediaProgress(src.id, `上传文件… ${p}%`, p));
   }
   chk(signal);
-  mediaJobs.set(src.id, jid);
-  return jid;
+  job = { id: jid.id, key: jid.key };
+  mediaJobs.set(src.id, job);
+  return job;
+}
+// 查询任务只用任务凭证，不依赖登录身份
+async function jobGet(job, sub, raw) {
+  let r;
+  try { r = await fetch(`/api/media/jobs/${job.id}${sub}`, { headers: { 'X-Job-Key': job.key || '' } }); }
+  catch { throw new Error('网络不通，连不上工具服务器'); }
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || `服务器错误 ${r.status}`); }
+  return raw ? r : r.json();
 }
 async function waitJobReady(src, jid, signal) {
   for (;;) {
     chk(signal);
-    const st = await backend(`/api/media/jobs/${jid}`);
+    const st = await jobGet(jid, '');
     if (st.state === 'ready') return st;
     if (st.state === 'error') { mediaJobs.delete(src.id); throw new Error(st.message || '音频准备失败'); }
     mediaProgress(src.id, st.message || '准备音频…');
@@ -2671,7 +2681,7 @@ async function processSource(id, signal) {
       if (doneIdx.has(c.idx)) continue;
       chk(signal);
       mediaProgress(id, `${modelLabel(listenM)} 听写中… ${doneIdx.size}/${chunks.length}（${mmss(c.start_ms)}）`, Math.round(doneIdx.size * 100 / chunks.length));
-      const res = await backend(`/api/media/jobs/${jid}/chunks/${c.idx}`, { raw: true });
+      const res = await jobGet(jid, `/chunks/${c.idx}`, true);
       const blob = await res.blob();
       const path = cloud.storage.userPath(session.user.id, `media/${id}/${c.idx}.mp3`);
       const up = await cloud.storage.upload(path, blob, { contentType: 'audio/mpeg', upsert: true });

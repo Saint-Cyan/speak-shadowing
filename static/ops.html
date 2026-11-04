@@ -86,7 +86,7 @@ const kv = (rows) => `<div class="kv">${rows.filter(Boolean).map(([k, v]) => `<b
 const lvlCls = (p) => (p == null ? '' : p >= 90 ? 'bad' : p >= 70 ? 'warn' : 'ok');
 const bar = (p) => (p == null ? '' : `<div class="bar"><i style="width:${Math.min(100, p)}%;background:${p >= 90 ? '#dc2626' : p >= 70 ? '#f59e0b' : '#2563eb'}"></i></div>`);
 const STATE = { downloading: '下载中', processing: '处理中', ready: '就绪', error: '失败' };
-const EV = { startup: '进程启动', job_created: '创建任务', job_ready: '音频就绪', job_error: '任务失败', job_not_found: '任务丢失', job_expired: '任务过期', auth_fallback: '登录核实失败', auth_verified: '登录核实成功', memory_high: '内存告警' };
+const EV = { startup: '进程启动', job_created: '创建任务', job_ready: '音频就绪', job_error: '任务失败', job_not_found: '任务丢失', job_key_mismatch: '任务凭证不符', job_expired: '任务过期', auth_fallback: '登录核实失败', auth_verified: '登录核实成功', memory_high: '内存告警' };
 
 function seenLog(s) {
   const key = 'ops.seen';
@@ -164,6 +164,7 @@ function render(s) {
     ['最近成功', a.last_ok_at ? tm(a.last_ok_at) : '—'],
     ['最近失败', a.last_error_at ? `${tm(a.last_error_at)}<div class="muted">${esc(a.last_error)}</div>` : '—'],
     ['ffmpeg', esc(s.ffmpeg)],
+    ['登录令牌形态', (J.token_shapes || []).length ? `<div class="muted">最近 ${J.token_shapes.length} 种不同令牌（只记形态不记内容）：</div>${J.token_shapes.slice(-6).reverse().map((x) => `<div class="muted">${tm(x.t)} · 长度 ${x.len} · ${x.parts} 段 · 摘要 ${esc(x.digest)}${x.iat ? ` · 签发 ${tm(x.iat)}` : ''}${x.exp ? ` · 过期 ${tm(x.exp)}` : ''}${x.jwt === false ? ' · 不是 JWT' : ''}</div>`).join('')}` : '—'],
   ]);
   const rq = Object.entries(s.requests);
   $('req').innerHTML = rq.length ? `<table><tr><th>接口</th><th class="n">次数</th><th class="n">4xx</th><th class="n">5xx</th><th class="n">平均耗时</th></tr>

@@ -250,6 +250,7 @@ def _jobs_summary():
                        "duration_ms": j.get("duration_ms")} for j in sorted(jobs, key=lambda x: -x["created"])[:20]],
             "work_dir": str(media.WORK), "work_bytes": dir_size(media.WORK),
             "auth": {k: media._auth_diag.get(k) for k in ("mode", "last_error", "last_error_at", "last_ok_at")},
+            "token_shapes": list(media._token_seen),
         }
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}

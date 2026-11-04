@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import ssl
 import time
@@ -83,6 +84,7 @@ async def require_user(request: Request) -> str:
         raise HTTPException(401, "请先登录")
     token = auth[7:].strip()
     key = hashlib.sha256(token.encode()).hexdigest()
+    _token_shape(token, key)
     hit = _tokens.get(key)
     if hit and hit[1] > time.time():
         return hit[0]
@@ -119,6 +121,22 @@ async def require_user(request: Request) -> str:
     uid = _jwt_sub(token) or f"ip:{ip}"
     _remember(key, uid, 60)
     return uid
+
+
+_token_seen: deque = deque(maxlen=20)
+
+
+def _token_shape(token: str, key: str):
+    """只记录登录令牌的“形态”（长度、段数、摘要前 8 位、声明的签发/过期时间），不记录内容，用来排查令牌为何每次不同。"""
+    shape = {"t": round(time.time(), 1), "len": len(token), "parts": token.count(".") + 1, "digest": key[:8]}
+    try:
+        part = token.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        shape.update(iat=payload.get("iat"), exp=payload.get("exp"), has_sub=bool(payload.get("sub")))
+    except Exception:  # noqa: BLE001
+        shape["jwt"] = False
+    if not _token_seen or _token_seen[-1]["digest"] != shape["digest"]:
+        _token_seen.append(shape)
 
 
 def _remember(key: str, uid: str, ttl: int):
@@ -163,7 +181,7 @@ async def diag():
     fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) if t else None  # noqa: E731
     return {"auth_mode": _auth_diag["mode"], "last_error": _auth_diag["last_error"],
             "last_error_at": fmt(_auth_diag["last_error_at"]), "last_ok_at": fmt(_auth_diag["last_ok_at"]),
-            "ffmpeg": ff, "active_jobs": active}
+            "ffmpeg": ff, "active_jobs": active, "token_shapes": list(_token_seen)}
 
 
 # ---------------- B 站 ----------------
@@ -359,8 +377,8 @@ def _new_job(uid: str, meta: dict) -> str:
         raise HTTPException(429, "服务器正忙，请稍后再试")
     jid = uuid.uuid4().hex[:16]
     _job_dir(jid).mkdir(parents=True, exist_ok=True)
-    _jobs[jid] = {"id": jid, "uid": uid, "created": time.time(), "state": "downloading", "message": "排队中…",
-                  "duration_ms": None, "chunks": [], **meta}
+    _jobs[jid] = {"id": jid, "uid": uid, "key": secrets.token_urlsafe(24), "created": time.time(), "state": "downloading",
+                  "message": "排队中…", "duration_ms": None, "chunks": [], **meta}
     event("job_created", f"任务 {jid[:6]} 已创建（{meta.get('source')}）")
     return jid
 
@@ -384,7 +402,7 @@ async def create_job(req: JobReq, request: Request):
         raise HTTPException(400, "单次导入最长 2 小时")
     jid = _new_job(uid, {"source": "bili", "title": (req.title or "")[:200]})
     asyncio.create_task(_bili_download(jid, req.bvid, req.cid, start, end))
-    return {"id": jid}
+    return {"id": jid, "key": _jobs[jid]["key"]}
 
 
 @router.post("/upload")
@@ -411,29 +429,35 @@ async def upload(request: Request, file: UploadFile = File(...), start_s: float 
     end = end_s if end_s and end_s > start else None
     _jobs[jid]["message"] = "上传完成，正在处理…"
     asyncio.create_task(_prepare(jid, src, start, end))
-    return {"id": jid}
+    return {"id": jid, "key": _jobs[jid]["key"]}
 
 
-def _get_job(jid: str, uid: str) -> dict:
+def _get_job(jid: str, request: Request) -> dict:
+    """按任务凭证访问：创建任务时返回的随机 key，前端放在 X-Job-Key 头里。不再比对用户身份。"""
     j = _jobs.get(jid)
-    if not j or j["uid"] != uid:
-        if not j:  # 这个进程里根本没有该任务：通常说明进程重启过，或请求落到了另一个实例
-            event("job_not_found", f"查询任务 {jid[:6]} 时本进程中不存在（已有 {len(_jobs)} 个任务）", "error")
+    if not j:  # 这个进程里根本没有该任务：通常说明进程重启过，或请求落到了另一个实例
+        event("job_not_found", f"查询任务 {jid[:6]} 时本进程中不存在（已有 {len(_jobs)} 个任务）", "error")
         raise HTTPException(404, "导入任务不存在或已过期（服务重启后需要重新准备音频）")
+    key = request.headers.get("x-job-key", "")
+    if not key or not secrets.compare_digest(key, j["key"]):
+        event("job_key_mismatch", f"查询任务 {jid[:6]} 时任务凭证{'缺失' if not key else '不匹配'}", "error")
+        raise HTTPException(403, "无权访问这个导入任务（任务凭证不符），请重新开始导入")
     return j
 
 
 @router.get("/jobs/{jid}")
 async def job_status(jid: str, request: Request):
-    uid = await require_user(request)
-    j = _get_job(jid, uid)
+    if not _ip_rate_ok(_client_ip(request)):
+        raise HTTPException(429, "请求太频繁，请稍后再试")
+    j = _get_job(jid, request)
     return {k: j[k] for k in ("id", "state", "message", "duration_ms", "chunks", "source", "title")}
 
 
 @router.get("/jobs/{jid}/chunks/{idx}")
 async def job_chunk(jid: str, idx: int, request: Request):
-    uid = await require_user(request)
-    j = _get_job(jid, uid)
+    if not _ip_rate_ok(_client_ip(request)):
+        raise HTTPException(429, "请求太频繁，请稍后再试")
+    j = _get_job(jid, request)
     if j["state"] != "ready" or not (0 <= idx < len(j["chunks"])):
         raise HTTPException(404, "这一段音频还没准备好")
     p = _job_dir(jid) / f"{idx}.mp3"
