@@ -1,6 +1,10 @@
-"""语音合成：腾讯云 TextToVoice，并给每个单词算出时间轴（用于逐词高亮、单词“句中读音”）。
+"""语音合成：两个引擎可选，都返回音频和每个单词的时间轴（用于逐词高亮、单词“句中读音”）。
 
-逐词时间的来源：
+- 微软 edge-tts：免费、口音多（新西兰 / 英 / 澳 / 美），但不是微软正式开放的接口，可能随时不可用。
+  服务启动时（也就是每次部署后）会合成一句短语检测是否可用，之后每 30 分钟复查；不可用时前端禁用这个选项。
+- 腾讯云 TextToVoice：正式商用接口，国内稳定，按字符计费（有免费额度）。
+
+腾讯云逐词时间的来源：
   - 精品 / 大模型音色：合成接口直接返回（EnableSubtitle）。
   - 超自然大模型音色：合成接口不返回，再把合成好的音频交给腾讯云「一句话识别」（带词级时间戳）对齐出来；
     识别失败时按单词长度在整段时长里估算。
@@ -21,7 +25,25 @@ import uuid
 from collections import OrderedDict
 from pathlib import Path
 
+import edge_tts
+
 import tencent
+from config import CONFIG
+
+EDGE_VOICES = [
+    {"id": "en-NZ-MollyNeural", "label": "新西兰 · Molly（女）"},
+    {"id": "en-NZ-MitchellNeural", "label": "新西兰 · Mitchell（男）"},
+    {"id": "en-US-AvaNeural", "label": "美国 · Ava（女）"},
+    {"id": "en-US-AndrewNeural", "label": "美国 · Andrew（男）"},
+    {"id": "en-US-EmmaNeural", "label": "美国 · Emma（女）"},
+    {"id": "en-US-BrianNeural", "label": "美国 · Brian（男）"},
+    {"id": "en-GB-SoniaNeural", "label": "英国 · Sonia（女）"},
+    {"id": "en-GB-RyanNeural", "label": "英国 · Ryan（男）"},
+    {"id": "en-AU-NatashaNeural", "label": "澳大利亚 · Natasha（女）"},
+    {"id": "en-AU-WilliamMultilingualNeural", "label": "澳大利亚 · William（男）"},
+]
+EDGE_IDS = {v["id"] for v in EDGE_VOICES}
+EDGE_DEFAULT = ("en-NZ-MollyNeural", "en-NZ-MitchellNeural")
 
 VOICES = [
     {"id": "403006", "label": "美式 · YunMia（女 · 超自然）", "timing": "asr", "rate": 24000, "tier": "超自然大模型"},
@@ -32,13 +54,20 @@ VOICES = [
 ]
 BY_ID = {v["id"]: v for v in VOICES}
 DEFAULT_A, DEFAULT_B = "403006", "403007"
+TC_DEFAULT = (DEFAULT_A, DEFAULT_B)
+# 站点默认引擎：config.json 的 tts_engine（edge / tencent），默认 edge
+DEFAULT_ENGINE = (CONFIG.get("tts_engine") or "edge").strip().lower()
+if DEFAULT_ENGINE not in ("edge", "tencent"):
+    DEFAULT_ENGINE = "edge"
+EDGE = {"ok": None, "checked_at": None, "error": None, "latency_ms": None, "last_ok_at": None}
+EDGE_RECHECK = 30 * 60
 
 PIECE_MAX = 480                       # 腾讯云单次英文最多 500 个字符，留余量
 CACHE_SIZE = 2000
 CACHE_DIR = Path(os.environ.get("TTS_CACHE_DIR", "/tmp/speak-tts"))
 _mem: "OrderedDict[str, dict]" = OrderedDict()
 _sem = asyncio.Semaphore(6)           # 超自然音色默认 10 并发，留余量
-STATS = {"synth_calls": 0, "chars": {}, "cache_mem": 0, "cache_disk": 0, "align_asr": 0, "align_estimate": 0,
+STATS = {"synth_calls": 0, "edge_calls": 0, "chars": {}, "cache_mem": 0, "cache_disk": 0, "align_asr": 0, "align_estimate": 0,
          "errors": 0, "last_error": None, "last_error_at": None}
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*")
@@ -240,13 +269,20 @@ def _mp3_ms(b: bytes) -> int:
     return round(total * 1000)
 
 
+def engine_of(voice_id: str):
+    return "edge" if voice_id in EDGE_IDS else "tencent" if voice_id in BY_ID else None
+
+
 async def synth(text: str, voice_id: str) -> dict:
+    eng = engine_of(voice_id)
+    if not eng:
+        raise TTSError("不支持的音色，请在播放设置里重新选择")
     voice = BY_ID.get(voice_id)
-    if not voice:
-        raise TTSError("不支持的音色")
-    if not tencent.enabled():
-        raise TTSError("服务器没有配置腾讯云密钥，无法合成语音")
-    key = hashlib.sha1(f"tc|{voice_id}|{text}".encode()).hexdigest()
+    if eng == "tencent" and not tencent.enabled():
+        raise TTSError("服务器没有配置腾讯云密钥，无法用腾讯云合成语音")
+    if eng == "edge" and EDGE["ok"] is False:
+        raise TTSError("微软 edge-tts 当前不可用，请在播放设置里把发音来源换成腾讯云")
+    key = hashlib.sha1(f"{'edge' if voice_id in EDGE_IDS else 'tc'}|{voice_id}|{text}".encode()).hexdigest()
     if key in _mem:
         _mem.move_to_end(key)
         STATS["cache_mem"] += 1
@@ -261,16 +297,19 @@ async def synth(text: str, voice_id: str) -> dict:
         except Exception:  # noqa: BLE001
             pass
     try:
-        audio, words, offset = bytearray(), [], 0
-        for a, w, d in await asyncio.gather(*[_piece(piece, voice) for piece in _split(text)]):
-            audio.extend(a)
-            words.extend({"t": x["t"] + offset, "d": x["d"], "w": x["w"]} for x in w)
-            offset += d
+        if eng == "edge":
+            res = await _edge_synth(text, voice_id)
+        else:
+            audio, words, offset = bytearray(), [], 0
+            for a, w, d in await asyncio.gather(*[_piece(piece, voice) for piece in _split(text)]):
+                audio.extend(a)
+                words.extend({"t": x["t"] + offset, "d": x["d"], "w": x["w"]} for x in w)
+                offset += d
+            res = {"audio": base64.b64encode(bytes(audio)).decode(), "words": words}
     except TTSError as e:
         STATS["errors"] += 1
         STATS["last_error"], STATS["last_error_at"] = str(e), time.time()
         raise
-    res = {"audio": base64.b64encode(bytes(audio)).decode(), "words": words}
     _remember(key, res)
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -284,3 +323,77 @@ def _remember(key: str, res: dict):
     _mem[key] = res
     if len(_mem) > CACHE_SIZE:
         _mem.popitem(last=False)
+
+
+# ---------------- 微软 edge-tts ----------------
+async def _edge_once(text: str, voice: str) -> dict:
+    comm = edge_tts.Communicate(text, voice, boundary="WordBoundary")
+    audio, words = bytearray(), []
+    async for chunk in comm.stream():
+        if chunk["type"] == "audio":
+            audio.extend(chunk["data"])
+        elif chunk["type"] == "WordBoundary":  # offset / duration 单位是 100 纳秒
+            words.append({"t": round(chunk["offset"] / 10000), "d": round(chunk["duration"] / 10000), "w": chunk["text"]})
+    if not audio:
+        raise RuntimeError("empty audio")
+    return {"audio": base64.b64encode(bytes(audio)).decode(), "words": words}
+
+
+async def _edge_synth(text: str, voice: str) -> dict:
+    last = None
+    for attempt in range(2):  # 微软接口偶发断连，重试一次
+        try:
+            res = await asyncio.wait_for(_edge_once(text, voice), timeout=30)
+            STATS["edge_calls"] += 1
+            if EDGE["ok"] is not True:
+                EDGE.update(ok=True, error=None, checked_at=time.time())
+            EDGE["last_ok_at"] = time.time()
+            return res
+        except Exception as e:  # noqa: BLE001
+            last = e
+            print(f"[tts] edge attempt {attempt + 1} failed: {type(e).__name__}: {e}", flush=True)
+            await asyncio.sleep(0.5)
+    # 连续失败：立刻再做一次可用性检测，不可用就让前端禁用
+    asyncio.get_event_loop().create_task(check_edge())
+    raise TTSError(f"微软 edge-tts 合成失败：{type(last).__name__}，可以在播放设置里把发音来源换成腾讯云")
+
+
+async def check_edge() -> bool:
+    """合成一句短语，看 edge-tts 能不能用。"""
+    t0 = time.time()
+    try:
+        await asyncio.wait_for(_edge_once("Hello, this is a quick check.", EDGE_DEFAULT[0]), timeout=20)
+        EDGE.update(ok=True, error=None, latency_ms=round((time.time() - t0) * 1000), last_ok_at=time.time())
+    except Exception as e:  # noqa: BLE001
+        EDGE.update(ok=False, error=f"{type(e).__name__}: {str(e)[:200]}", latency_ms=None)
+    EDGE["checked_at"] = time.time()
+    try:
+        from ops import event
+        event("edge_check", f"微软 edge-tts {'可用' if EDGE['ok'] else '不可用：' + (EDGE['error'] or '')}"
+              + (f"（{EDGE['latency_ms']} ms）" if EDGE["ok"] else ""), "info" if EDGE["ok"] else "warn")
+    except Exception:  # noqa: BLE001
+        pass
+    return EDGE["ok"]
+
+
+async def edge_watch():
+    """服务启动时检测一次，之后每 30 分钟复查。"""
+    while True:
+        await check_edge()
+        await asyncio.sleep(EDGE_RECHECK)
+
+
+def status() -> dict:
+    return {
+        "default_engine": DEFAULT_ENGINE,
+        "engines": {
+            "edge": {"available": EDGE["ok"], "checking": EDGE["ok"] is None, "error": EDGE["error"],
+                     "checked_at": EDGE["checked_at"], "label": "微软 edge-tts（免费，新西兰 / 英 / 澳 / 美口音）",
+                     "voices": EDGE_VOICES, "default": list(EDGE_DEFAULT)},
+            "tencent": {"available": tencent.enabled(), "checking": False,
+                        "error": None if tencent.enabled() else "服务器没有配置腾讯云密钥",
+                        "label": "腾讯云（国内稳定，按字符计费）",
+                        "voices": [{"id": v["id"], "label": v["label"], "word_timing": v["timing"]} for v in VOICES],
+                        "default": list(TC_DEFAULT)},
+        },
+    }

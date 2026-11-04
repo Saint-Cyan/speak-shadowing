@@ -126,6 +126,7 @@
   .addline{width:100%;padding:11px;margin-bottom:12px}
   details summary{cursor:pointer;color:var(--muted);font-size:13px}
   .mpick{margin-top:6px}
+  .engine-hint{grid-column:1/-1;background:#fffbeb;color:#78350f;border-radius:8px;padding:6px 10px;font-size:13px}
   .w{cursor:pointer}
   .w.hard{border-bottom:1.5px dotted #b45309;background:#fef3c7}
   body.no-vocab .vb,.sent.hide .vb{display:none}
@@ -247,6 +248,10 @@
 <details class="card ctrl" id="ctrl" open>
   <summary class="ctrl-sum">播放设置</summary>
   <div class="grid">
+    <label>发音来源
+      <select id="engine"><option value="edge">微软 edge-tts（免费 · 多口音）</option><option value="tencent">腾讯云（国内稳定）</option></select>
+    </label>
+    <div id="engineHint" class="engine-hint" hidden></div>
     <label><span id="lblVoiceA">口音</span>
       <select id="voiceA"></select>
     </label>
@@ -431,22 +436,76 @@ function openSheet(title, opts) {
 
 /* ================= 设置 ================= */
 const settings = Object.assign(
-  { voiceA: '403006', voiceB: '403007', rate: 1, repeat: 1, gap: 'short', mode: 'all', hideMine: false, showZh: true,
+  { engine: null, voiceA: null, voiceB: null, rate: 1, repeat: 1, gap: 'short', mode: 'all', hideMine: false, showZh: true,
     showVocab: true, vocabOpen: false, vocabLevel: 'medium', ipa: 'us', modelConfirmed: false },
   LS.get('settings', {})
 );
 if (settings.voice && !LS.get('settings', {}).voiceA) settings.voiceA = settings.voice; // 兼容旧版
-// 腾讯云语音合成音色（与后端 tts.py 保持一致）
-const VOICES = [
-  ['403006', '美式 · YunMia（女 · 超自然）'], ['403007', '美式 · YunLeo（男 · 超自然）'],
-  ['501009', 'WeWinny（女 · 大模型）'], ['501008', 'WeJames（男 · 大模型）'], ['101050', 'WeJack（男 · 精品）'],
-];
-// 旧版保存的是微软音色名：换成新的默认音色
-if (!VOICES.some(([v]) => v === settings.voiceA)) settings.voiceA = '403006';
-if (!VOICES.some(([v]) => v === settings.voiceB)) settings.voiceB = '403007';
-const voiceOpts = VOICES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
-$('voiceA').innerHTML = voiceOpts; $('voiceB').innerHTML = voiceOpts;
-$('voiceA').value = settings.voiceA; $('voiceB').value = settings.voiceB;
+// 两个发音来源的音色（与后端 tts.py 保持一致；页面加载后以 /api/voices 为准）
+const ENGINES = {
+  edge: { voices: [
+    ['en-NZ-MollyNeural', '新西兰 · Molly（女）'], ['en-NZ-MitchellNeural', '新西兰 · Mitchell（男）'],
+    ['en-US-AvaNeural', '美国 · Ava（女）'], ['en-US-AndrewNeural', '美国 · Andrew（男）'],
+    ['en-US-EmmaNeural', '美国 · Emma（女）'], ['en-US-BrianNeural', '美国 · Brian（男）'],
+    ['en-GB-SoniaNeural', '英国 · Sonia（女）'], ['en-GB-RyanNeural', '英国 · Ryan（男）'],
+    ['en-AU-NatashaNeural', '澳大利亚 · Natasha（女）'], ['en-AU-WilliamMultilingualNeural', '澳大利亚 · William（男）'],
+  ], def: ['en-NZ-MollyNeural', 'en-NZ-MitchellNeural'], available: null },
+  tencent: { voices: [
+    ['403006', '美式 · YunMia（女 · 超自然）'], ['403007', '美式 · YunLeo（男 · 超自然）'],
+    ['501009', 'WeWinny（女 · 大模型）'], ['501008', 'WeJames（男 · 大模型）'], ['101050', 'WeJack（男 · 精品）'],
+  ], def: ['403006', '403007'], available: null },
+};
+const engineOf = (v) => Object.keys(ENGINES).find((k) => ENGINES[k].voices.some(([id]) => id === v));
+// 各引擎分别记住 A / B 选过的音色；旧版只存了 voiceA / voiceB，按音色归到对应引擎
+settings.voices = settings.voices || {};
+['voiceA', 'voiceB'].forEach((k, i) => {
+  const e = engineOf(settings[k]);
+  if (e) { settings.voices[e] = settings.voices[e] || []; settings.voices[e][i] = settings.voices[e][i] || settings[k]; }
+});
+if (!settings.engine) settings.engine = engineOf(settings.voiceA) || 'edge';
+let engine = settings.engine; // 实际使用的引擎（首选不可用时临时换成另一个）
+function applyEngine() {
+  const E = ENGINES[engine];
+  const pick = (i) => { const v = (settings.voices[engine] || [])[i]; return E.voices.some(([id]) => id === v) ? v : E.def[i]; };
+  settings.voiceA = pick(0); settings.voiceB = pick(1);
+  const opts = E.voices.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('');
+  $('voiceA').innerHTML = opts; $('voiceB').innerHTML = opts;
+  $('voiceA').value = settings.voiceA; $('voiceB').value = settings.voiceB;
+  $('engine').value = engine;
+}
+function renderEngineHint() {
+  const ed = ENGINES.edge, tc = ENGINES.tencent;
+  const eo = $('engine').querySelector('[value=edge]'), to = $('engine').querySelector('[value=tencent]');
+  eo.disabled = ed.available === false; to.disabled = tc.available === false;
+  eo.textContent = '微软 edge-tts（免费 · 多口音）' + (ed.available === false ? ' · 当前不可用' : ed.available === null ? ' · 检测中' : '');
+  to.textContent = '腾讯云（国内稳定）' + (tc.available === false ? ' · 未配置' : '');
+  let hint = '';
+  if (ed.available === false) hint = `微软 edge-tts 当前不可用（${ed.error || '连接失败'}），已禁用该选项${settings.engine === 'edge' ? '，暂时改用腾讯云' : ''}。服务器每 30 分钟会重新检测。`;
+  if (tc.available === false && engine === 'tencent') hint = '服务器没有配置腾讯云密钥，无法使用腾讯云发音。';
+  const el = $('engineHint'); el.textContent = hint; el.hidden = !hint;
+}
+async function loadEngines() {
+  try {
+    const r = await fetch('/api/voices', { cache: 'no-store' });
+    const j = await r.json();
+    Object.entries(j.engines || {}).forEach(([k, v]) => {
+      if (!ENGINES[k]) return;
+      ENGINES[k].available = v.checking ? null : !!v.available;
+      ENGINES[k].error = v.error;
+      if (Array.isArray(v.voices) && v.voices.length) ENGINES[k].voices = v.voices.map((x) => [x.id, x.label]);
+      if (Array.isArray(v.default)) ENGINES[k].def = v.default;
+    });
+    if (!LS.get('settings', {}).engine && j.default_engine && ENGINES[j.default_engine]) settings.engine = j.default_engine; // 没选过就跟站点默认
+    const want = settings.engine, other = want === 'edge' ? 'tencent' : 'edge';
+    const next = ENGINES[want].available === false && ENGINES[other].available !== false ? other : want;
+    if (next !== engine) { engine = next; applyEngine(); stopAll(); sentences.forEach((x) => { x.key = null; x.audio = null; }); renderList(); prefetch(); }
+    else applyEngine();
+    renderEngineHint();
+    if (ENGINES.edge.available === null) setTimeout(loadEngines, 4000); // 启动检测还没出结果：稍后再查
+  } catch { setTimeout(loadEngines, 10000); }
+}
+applyEngine();
+renderEngineHint();
 $('rate').value = settings.rate; $('repeat').value = String(settings.repeat); $('gap').value = settings.gap;
 $('mode').value = settings.mode; $('hideMine').checked = settings.hideMine; $('showZh').checked = settings.showZh;
 $('showVocab').checked = settings.showVocab !== false;
@@ -458,8 +517,14 @@ $('ctrl').addEventListener('toggle', () => { settings.ctrlOpen = $('ctrl').open;
 const showRate = () => { $('rateVal').textContent = Number(settings.rate).toFixed(2).replace(/0$/, '') + '×'; };
 showRate();
 const saveSettings = () => LS.set('settings', settings);
-$('voiceA').onchange = (e) => { settings.voiceA = e.target.value; saveSettings(); stopAll(); prefetch(); };
-$('voiceB').onchange = (e) => { settings.voiceB = e.target.value; saveSettings(); stopAll(); prefetch(); };
+const remember = (i, v) => { settings.voices[engine] = settings.voices[engine] || []; settings.voices[engine][i] = v; };
+$('voiceA').onchange = (e) => { settings.voiceA = e.target.value; remember(0, settings.voiceA); saveSettings(); stopAll(); prefetch(); };
+$('voiceB').onchange = (e) => { settings.voiceB = e.target.value; remember(1, settings.voiceB); saveSettings(); stopAll(); prefetch(); };
+$('engine').onchange = (e) => {
+  settings.engine = engine = e.target.value; applyEngine(); renderEngineHint(); saveSettings();
+  stopAll(); sentences.forEach((x) => { x.key = null; x.audio = null; }); renderList(); prefetch();
+};
+loadEngines();
 $('rate').oninput = (e) => { settings.rate = Number(e.target.value); showRate(); player.playbackRate = settings.rate; saveSettings(); };
 $('repeat').onchange = (e) => { settings.repeat = Number(e.target.value); saveSettings(); };
 $('gap').onchange = (e) => { settings.gap = e.target.value; saveSettings(); };

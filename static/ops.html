@@ -67,7 +67,7 @@
     <section class="card"><h2>磁盘与导入临时文件</h2><div id="disk"></div></section>
     <section class="card wide"><h2>导入任务（服务器端，只保存在内存里）</h2><div id="jobs"></div></section>
     <section class="card"><h2>登录核实与依赖</h2><div id="auth"></div></section>
-    <section class="card"><h2>语音合成（腾讯云，本进程启动以来）</h2><div id="tts"></div></section>
+    <section class="card"><h2>语音合成（本进程启动以来）</h2><div id="tts"></div></section>
     <section class="card"><h2>本页观察到的实例变化</h2><div class="muted">打开本页期间，每次刷新如果进程编号或主机名变了就记一条：同一主机换了进程 = 重启；主机名来回变 = 多实例。</div><div id="seen" class="log"></div><button id="clearSeen" style="margin-top:6px">清空记录</button></section>
     <section class="card wide"><h2>接口请求统计（本进程启动以来）</h2><div id="req"></div></section>
     <section class="card wide"><h2>事件日志</h2><div id="events" class="log"></div></section>
@@ -87,7 +87,7 @@ const kv = (rows) => `<div class="kv">${rows.filter(Boolean).map(([k, v]) => `<b
 const lvlCls = (p) => (p == null ? '' : p >= 90 ? 'bad' : p >= 70 ? 'warn' : 'ok');
 const bar = (p) => (p == null ? '' : `<div class="bar"><i style="width:${Math.min(100, p)}%;background:${p >= 90 ? '#dc2626' : p >= 70 ? '#f59e0b' : '#2563eb'}"></i></div>`);
 const STATE = { downloading: '下载中', processing: '处理中', ready: '就绪', error: '失败' };
-const EV = { startup: '进程启动', job_created: '创建任务', job_ready: '音频就绪', job_error: '任务失败', job_not_found: '任务丢失', job_key_mismatch: '任务凭证不符', asr_submitted: '提交识别', asr_done: '识别完成', asr_failed: '识别失败', asr_fetch: '腾讯云取音频', soe_error: '口语评测失败', job_expired: '任务过期', auth_fallback: '登录核实失败', auth_verified: '登录核实成功', memory_high: '内存告警' };
+const EV = { startup: '进程启动', job_created: '创建任务', job_ready: '音频就绪', job_error: '任务失败', job_not_found: '任务丢失', job_key_mismatch: '任务凭证不符', asr_submitted: '提交识别', asr_done: '识别完成', asr_failed: '识别失败', asr_fetch: '腾讯云取音频', soe_error: '口语评测失败', edge_check: 'edge-tts 检测', job_expired: '任务过期', auth_fallback: '登录核实失败', auth_verified: '登录核实成功', memory_high: '内存告警' };
 
 function seenLog(s) {
   const key = 'ops.seen';
@@ -170,7 +170,10 @@ function render(s) {
   ]);
   const T = s.tts || {};
   $('tts').innerHTML = T.error ? `<div class="bad">${esc(T.error)}</div>` : kv([
-    ['合成次数', T.synth_calls ?? 0],
+    ['默认发音来源', T.default_engine === 'tencent' ? '腾讯云' : '微软 edge-tts'],
+    ['微软 edge-tts', T.edge ? (T.edge.ok === null ? '<span class="pill">检测中</span>' : T.edge.ok ? `<span class="pill ok">可用</span> ${T.edge.latency_ms ? T.edge.latency_ms + ' ms' : ''}` : `<span class="pill bad">不可用</span> <span class="muted">${esc(T.edge.error || '')}</span>`) + `<div class="muted">上次检测 ${tm(T.edge.checked_at)}，每 30 分钟复查</div>` : '—'],
+    ['edge-tts 合成次数', T.edge_calls ?? 0],
+    ['腾讯云合成次数', T.synth_calls ?? 0],
     ['消耗字符', Object.entries(T.chars || {}).map(([k, v]) => `${esc(k)} ${v}`).join('；') || '0'],
     ['命中缓存', `内存 ${T.cache_mem ?? 0} 次 · 磁盘 ${T.cache_disk ?? 0} 次（磁盘缓存 ${T.cache_files ?? 0} 条）`],
     ['逐词时间', `识别对齐 ${T.align_asr ?? 0} 次 · 估算 ${T.align_estimate ?? 0} 次`],

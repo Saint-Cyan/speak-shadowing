@@ -241,6 +241,8 @@ def _tts_stats():
         import tts
         st = dict(tts.STATS)
         st["cache_dir"] = str(tts.CACHE_DIR)
+        st["edge"] = dict(tts.EDGE)
+        st["default_engine"] = tts.DEFAULT_ENGINE
         st["cache_files"] = len(list(tts.CACHE_DIR.glob("*.json"))) if tts.CACHE_DIR.exists() else 0
         return st
     except Exception as e:  # noqa: BLE001

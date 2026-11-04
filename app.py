@@ -1,11 +1,11 @@
-"""口语跟读工具后端：静态页面 + 腾讯云逐句语音合成接口（见 tts.py）。
+"""口语跟读工具后端：静态页面 + 逐句语音合成接口（微软 edge-tts / 腾讯云，见 tts.py）。
 
 接口：
   GET  /api/health          健康检查
   GET  /api/voices          可选口音列表
   /api/media/*             视频 / 音频导入（见 media.py）
   /ops、/api/ops/*         运维监控（见 ops.py）
-  POST /api/tts             {"text": "...", "voice": "403006"}（腾讯云音色 ID）
+  POST /api/tts             {"text": "...", "voice": "en-NZ-MollyNeural" 或 "403006"}（按音色判断引擎）
                             返回 {"audio": base64 mp3, "words": [{"t": 起始ms, "d": 时长ms, "w": 单词}]}
 """
 
@@ -45,6 +45,7 @@ app.include_router(ops.router)
 @app.on_event("startup")
 async def _ops_start():
     ops.start()
+    asyncio.get_event_loop().create_task(tts_engine.edge_watch())  # 部署后立即检测 edge-tts 是否可用（不阻塞启动）
 
 
 @app.middleware("http")
@@ -89,8 +90,8 @@ async def health():
 
 @app.get("/api/voices")
 async def voices():
-    return {"voices": [{"id": v["id"], "label": v["label"], "word_timing": v["timing"]} for v in tts_engine.VOICES],
-            "default_a": tts_engine.DEFAULT_A, "default_b": tts_engine.DEFAULT_B}
+    """两个引擎的音色列表、可用性（edge-tts 在启动时检测）和站点默认引擎。"""
+    return tts_engine.status()
 
 
 @app.post("/api/tts")
@@ -100,7 +101,7 @@ async def tts(req: TTSReq, request: Request):
         raise HTTPException(400, "文本为空")
     if len(text) > MAX_CHARS:
         raise HTTPException(413, f"单句过长（上限 {MAX_CHARS} 字符）")
-    if req.voice not in tts_engine.BY_ID:
+    if not tts_engine.engine_of(req.voice):
         raise HTTPException(400, "不支持的音色，请在播放设置里重新选择")
     if not _rate_ok(_client_ip(request)):
         raise HTTPException(429, "请求太频繁，请稍后再试")
