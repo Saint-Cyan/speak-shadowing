@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>运维监控 · 口语跟读</title>
+<link rel="icon" href="/static/icon-192.png">
+<style>
+  :root{--bg:#f6f7fb;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--brand:#2563eb;--ok:#047857;--warn:#b45309;--bad:#b91c1c}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif}
+  header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);padding:10px 16px}
+  .hrow{max-width:1100px;margin:0 auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  h1{font-size:17px;margin:0;flex:1}
+  .wrap{max-width:1100px;margin:0 auto;padding:14px 16px 40px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .card h2{font-size:15px;margin:0 0 8px;font-weight:500}
+  .muted{color:var(--muted);font-size:13px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:13px}
+  .kv b{font-weight:400;color:var(--muted)}
+  .metric{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin:2px 0 10px}
+  .m{background:#f9fafb;border-radius:10px;padding:8px 10px}
+  .m span{display:block;font-size:12px;color:var(--muted)}
+  .m b{font-size:18px;font-weight:500}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+  .pill{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;background:#f3f4f6}
+  .pill.ok{background:#ecfdf5}.pill.warn{background:#fffbeb}.pill.bad{background:#fef2f2}
+  .bar{height:8px;border-radius:4px;background:#eef0f4;overflow:hidden;margin:3px 0 8px}
+  .bar i{display:block;height:100%;background:var(--brand)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:400}
+  td.n,th.n{text-align:right;white-space:nowrap}
+  .log{max-height:340px;overflow:auto;font-size:13px}
+  .log div{padding:4px 0;border-bottom:1px dashed var(--line)}
+  .log .t{color:var(--muted);margin-right:6px;white-space:nowrap}
+  button{font:inherit;border:1px solid var(--line);background:#fff;border-radius:8px;padding:5px 10px;cursor:pointer}
+  svg{display:block;width:100%;height:auto}
+  .legend{display:flex;gap:12px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+  .legend i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:4px;vertical-align:middle}
+  .wide{grid-column:1/-1}
+  .banner{border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:14px}
+  .banner.warn{background:#fffbeb;border:1px solid #fde68a;color:#78350f}
+  .banner.bad{background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<header><div class="hrow">
+  <h1>运维监控</h1>
+  <span class="muted" id="upd">加载中…</span>
+  <label class="muted"><input type="checkbox" id="auto" checked> 每 5 秒刷新</label>
+  <button id="refresh">刷新</button>
+  <a class="muted" href="/">返回工具</a>
+</div></header>
+<div class="wrap">
+  <div id="banners"></div>
+  <div class="grid">
+    <section class="card"><h2>实例</h2><div id="inst"></div></section>
+    <section class="card"><h2>规格</h2><div id="spec"></div></section>
+    <section class="card wide"><h2>资源曲线（最近 1 小时，本进程）</h2>
+      <div class="legend"><span><i style="background:#2563eb"></i>容器已用内存</span><span><i style="background:#7c3aed"></i>本进程 + ffmpeg</span><span><i style="background:#dc2626"></i>容器上限</span><span><i style="background:#059669"></i>CPU %（右轴）</span><span><i style="background:#f59e0b"></i>进行中的导入</span></div>
+      <div id="chart"></div>
+    </section>
+    <section class="card"><h2>内存</h2><div id="mem"></div></section>
+    <section class="card"><h2>磁盘与导入临时文件</h2><div id="disk"></div></section>
+    <section class="card wide"><h2>导入任务（服务器端，只保存在内存里）</h2><div id="jobs"></div></section>
+    <section class="card"><h2>登录核实与依赖</h2><div id="auth"></div></section>
+    <section class="card"><h2>本页观察到的实例变化</h2><div class="muted">打开本页期间，每次刷新如果进程编号或主机名变了就记一条：同一主机换了进程 = 重启；主机名来回变 = 多实例。</div><div id="seen" class="log"></div><button id="clearSeen" style="margin-top:6px">清空记录</button></section>
+    <section class="card wide"><h2>接口请求统计（本进程启动以来）</h2><div id="req"></div></section>
+    <section class="card wide"><h2>事件日志</h2><div id="events" class="log"></div></section>
+    <section class="card wide" id="prevCard" hidden><h2>上一个进程留下的记录</h2><div id="prev"></div></section>
+  </div>
+</div>
+<script>
+(() => {
+'use strict';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const MB = (b) => (b == null ? '—' : b >= 1 << 30 ? (b / (1 << 30)).toFixed(2) + ' GB' : Math.round(b / (1 << 20)) + ' MB');
+const pct = (a, b) => (a != null && b ? Math.round(a / b * 100) : null);
+const tm = (t) => { if (!t) return '—'; const d = new Date(t * 1000); return `${d.getMonth() + 1}/${d.getDate()} ${d.toTimeString().slice(0, 8)}`; };
+const dur = (s) => { if (s == null) return '—'; s = Math.round(s); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}天${h}小时` : h ? `${h}小时${m}分` : m ? `${m}分${s % 60}秒` : `${s}秒`; };
+const kv = (rows) => `<div class="kv">${rows.filter(Boolean).map(([k, v]) => `<b>${esc(k)}</b><span>${v}</span>`).join('')}</div>`;
+const lvlCls = (p) => (p == null ? '' : p >= 90 ? 'bad' : p >= 70 ? 'warn' : 'ok');
+const bar = (p) => (p == null ? '' : `<div class="bar"><i style="width:${Math.min(100, p)}%;background:${p >= 90 ? '#dc2626' : p >= 70 ? '#f59e0b' : '#2563eb'}"></i></div>`);
+const STATE = { downloading: '下载中', processing: '处理中', ready: '就绪', error: '失败' };
+const EV = { startup: '进程启动', job_created: '创建任务', job_ready: '音频就绪', job_error: '任务失败', job_not_found: '任务丢失', job_expired: '任务过期', auth_fallback: '登录核实失败', auth_verified: '登录核实成功', memory_high: '内存告警' };
+
+function seenLog(s) {
+  const key = 'ops.seen';
+  let log = []; try { log = JSON.parse(localStorage.getItem(key) || '[]'); } catch {}
+  const last = log[log.length - 1];
+  const cur = { t: s.now, inst: s.instance.id, pid: s.instance.pid, host: s.instance.host, started: s.instance.started };
+  if (!last || last.inst !== cur.inst) {
+    cur.why = !last ? '开始观察' : last.host !== cur.host ? '主机名变了（可能是另一个实例 / 新沙箱）' : '同一主机换了进程（重启）';
+    log.push(cur); log = log.slice(-50);
+    localStorage.setItem(key, JSON.stringify(log));
+  }
+  $('seen').innerHTML = log.slice().reverse().map((x) => `<div><span class="t">${tm(x.t)}</span>${esc(x.why)} · 进程 ${esc(x.inst)}（pid ${x.pid}）· 主机 ${esc(x.host)} · 启动于 ${tm(x.started)}</div>`).join('') || '<div class="muted">暂无</div>';
+  return log;
+}
+$('clearSeen').onclick = () => { localStorage.removeItem('ops.seen'); load(); };
+
+function render(s) {
+  const c = s.memory.cgroup, pm = s.memory.process, ch = s.memory.children, sm = s.memory.system;
+  const limit = c.limit || sm.total;
+  const used = c.current;
+  const up = pct(used, limit);
+  // 告警
+  const banners = [];
+  if (c.oom_kill) banners.push(['bad', `容器内已发生 ${c.oom_kill} 次 OOM 杀进程（内存超限）。这很可能就是导入任务丢失的原因。`]);
+  if (up != null && up >= 90) banners.push(['bad', `容器内存使用 ${up}%，接近上限。`]);
+  if (s.instance.uptime_s < 600) banners.push(['warn', `当前进程刚启动 ${dur(s.instance.uptime_s)}：最近发生过重启或新部署。`]);
+  if (s.jobs && s.jobs.auth && s.jobs.auth.mode === 'fallback') banners.push(['warn', '登录核实处于退回模式（分享码 + 限流）。']);
+  const nf = (s.events || []).filter((e) => e.kind === 'job_not_found').length;
+  if (nf) banners.push(['bad', `本进程记录到 ${nf} 次“任务在本进程中不存在”：说明前端查询的任务是别的进程建的（重启或多实例）。`]);
+  $('banners').innerHTML = banners.map(([k, t]) => `<div class="banner ${k}">${esc(t)}</div>`).join('');
+
+  const i = s.instance;
+  $('inst').innerHTML = kv([
+    ['进程编号', `<b>${esc(i.id)}</b>`], ['PID', i.pid], ['主机名', esc(i.host)],
+    ['进程启动', `${tm(i.started)}（已运行 ${dur(i.uptime_s)}）`],
+    ['机器开机', i.boot_time ? `${tm(i.boot_time)}（${dur(s.now - i.boot_time)}前）` : '—'],
+    ['Python', esc(i.python)], ['系统', esc(i.platform)],
+  ]);
+  $('spec').innerHTML = kv([
+    ['CPU 核数（可见）', s.cpu.count ?? '—'],
+    ['CPU 配额', s.cpu.quota_cores != null ? s.cpu.quota_cores + ' 核' : '未限制 / 读不到'],
+    ['负载 1/5/15 分钟', s.cpu.load ? s.cpu.load.join(' / ') : '—'],
+    ['本进程 CPU', s.cpu.process_pct != null ? s.cpu.process_pct + '%' : '—'],
+    ['内存上限（容器）', c.limit ? MB(c.limit) : '未限制 / 读不到'],
+    ['物理内存（机器）', MB(sm.total)],
+    ['/tmp 磁盘', `${MB(s.disk.tmp.free)} 可用 / ${MB(s.disk.tmp.total)}`],
+    ['cgroup 版本', c.version ? 'v' + c.version : '—'],
+  ]);
+  $('mem').innerHTML = `<div class="metric">
+      <div class="m"><span>容器已用</span><b class="${lvlCls(up)}">${MB(used)}</b></div>
+      <div class="m"><span>容器峰值</span><b>${MB(c.peak)}</b></div>
+      <div class="m"><span>OOM 杀进程</span><b class="${c.oom_kill ? 'bad' : 'ok'}">${c.oom_kill ?? '—'}</b></div>
+      <div class="m"><span>机器可用</span><b>${MB(sm.available)}</b></div></div>
+    ${up != null ? `<div class="muted">容器内存 ${up}%（${MB(used)} / ${MB(limit)}）</div>${bar(up)}` : ''}
+    ${kv([['本进程', `${MB(pm.rss)}（峰值 ${MB(pm.peak)}）`], ['ffmpeg 子进程', ch.count == null ? '—' : `${ch.count} 个，${MB(ch.rss)}`],
+      ['本进程启动以来峰值', `进程+子进程 ${MB(s.memory.peak_since_start.process_and_children)}，容器 ${MB(s.memory.peak_since_start.cgroup)}`]])}`;
+  const tp = pct(s.disk.tmp.total - s.disk.tmp.free, s.disk.tmp.total);
+  $('disk').innerHTML = `${tp != null ? `<div class="muted">/tmp 已用 ${tp}%</div>${bar(tp)}` : ''}` + kv([
+    ['/tmp', `${MB(s.disk.tmp.free)} 可用 / ${MB(s.disk.tmp.total)}`],
+    ['导入临时目录', s.jobs.work_dir ? `${esc(s.jobs.work_dir)}：${MB(s.jobs.work_bytes)}` : '—'],
+    ['监控记录目录', esc(s.disk.ops.path)],
+  ]);
+  const J = s.jobs;
+  $('jobs').innerHTML = J.error ? `<div class="bad">${esc(J.error)}</div>` : `<div class="metric">
+      <div class="m"><span>任务总数</span><b>${J.total}</b></div><div class="m"><span>进行中</span><b>${J.active}</b></div>
+      <div class="m"><span>就绪</span><b class="ok">${J.by_state.ready}</b></div><div class="m"><span>失败</span><b class="${J.by_state.error ? 'bad' : ''}">${J.by_state.error}</b></div></div>
+    ${J.items.length ? `<table><tr><th>任务</th><th>来源</th><th>状态</th><th>说明</th><th class="n">已存在</th><th class="n">分段</th><th class="n">时长</th></tr>
+      ${J.items.map((x) => `<tr><td>${esc(x.id)}</td><td>${x.source === 'bili' ? 'B 站' : '本地文件'}</td>
+        <td><span class="pill ${x.state === 'error' ? 'bad' : x.state === 'ready' ? 'ok' : 'warn'}">${STATE[x.state] || x.state}</span></td>
+        <td>${esc(x.message)}</td><td class="n">${dur(x.age_s)}</td><td class="n">${x.chunks || ''}</td><td class="n">${x.duration_ms ? dur(x.duration_ms / 1000) : ''}</td></tr>`).join('')}</table>`
+      : '<div class="muted">本进程里没有导入任务。</div>'}`;
+  const a = J.auth || {};
+  $('auth').innerHTML = kv([
+    ['登录核实', a.mode === 'verified' ? '<span class="pill ok">严格核实</span>' : a.mode === 'fallback' ? '<span class="pill warn">退回分享码模式</span>' : '<span class="pill">尚无导入请求</span>'],
+    ['最近成功', a.last_ok_at ? tm(a.last_ok_at) : '—'],
+    ['最近失败', a.last_error_at ? `${tm(a.last_error_at)}<div class="muted">${esc(a.last_error)}</div>` : '—'],
+    ['ffmpeg', esc(s.ffmpeg)],
+  ]);
+  const rq = Object.entries(s.requests);
+  $('req').innerHTML = rq.length ? `<table><tr><th>接口</th><th class="n">次数</th><th class="n">4xx</th><th class="n">5xx</th><th class="n">平均耗时</th></tr>
+    ${rq.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.n}</td><td class="n ${v.err4 ? 'warn' : ''}">${v.err4}</td><td class="n ${v.err5 ? 'bad' : ''}">${v.err5}</td><td class="n">${v.avg_ms} ms</td></tr>`).join('')}</table>
+    ${s.recent_errors.length ? `<div class="muted" style="margin-top:8px">最近的错误请求：${s.recent_errors.slice().reverse().map((e) => `${tm(e.t)} ${esc(e.path)} → ${e.status}`).join('；')}</div>` : ''}`
+    : '<div class="muted">暂无</div>';
+  const evRow = (e) => `<div><span class="t">${tm(e.t)}</span><span class="pill ${e.level === 'error' ? 'bad' : e.level === 'warn' ? 'warn' : ''}">${esc(EV[e.kind] || e.kind)}</span> ${esc(e.msg)}${e.inst && e.inst !== s.instance.id ? ` <span class="muted">（进程 ${esc(e.inst)}）</span>` : ''}</div>`;
+  $('events').innerHTML = (s.events || []).slice().reverse().map(evRow).join('') || '<div class="muted">暂无</div>';
+  const P = s.previous;
+  $('prevCard').hidden = !P;
+  if (P) {
+    const ls = P.last_sample;
+    $('prev').innerHTML = (ls ? kv([
+      ['进程编号', `${esc(ls.inst)}（pid ${ls.pid}）`], ['最后一次采样', `${tm(ls.t)}（本进程启动前 ${dur(s.instance.started - ls.t)}）`],
+      ['当时容器内存', `${MB(ls.cg_used)} / ${MB(ls.cg_limit)}${ls.cg_used && ls.cg_limit ? `（${pct(ls.cg_used, ls.cg_limit)}%）` : ''}`],
+      ['当时进程 / ffmpeg', `${MB(ls.rss)} / ${MB(ls.child_rss)}`], ['当时进行中的导入', ls.jobs ?? '—'], ['当时 OOM 计数', ls.oom_kill ?? '—'],
+    ]) : '') + (P.last_events.length ? `<div class="muted" style="margin-top:8px">它最后的事件：</div><div class="log">${P.last_events.slice().reverse().map(evRow).join('')}</div>` : '');
+  }
+  seenLog(s);
+}
+
+function chart(samples) {
+  if (samples.length < 2) { $('chart').innerHTML = '<div class="muted">刚启动，采样不足，稍等十几秒。</div>'; return; }
+  const W = 1000, H = 220, L = 50, R = 40, T = 10, B = 24;
+  const t0 = samples[0].t, t1 = samples[samples.length - 1].t || t0 + 1;
+  const x = (t) => L + (t - t0) / Math.max(1, t1 - t0) * (W - L - R);
+  const lim = Math.max(...samples.map((s) => s.cg_limit || 0));
+  const top = Math.max(lim, ...samples.map((s) => Math.max(s.cg_used || 0, (s.rss || 0) + (s.child_rss || 0)))) * 1.08 || 1;
+  const y = (v) => T + (1 - v / top) * (H - T - B);
+  const cpuTop = Math.max(100, ...samples.map((s) => s.cpu || 0));
+  const yc = (v) => T + (1 - v / cpuTop) * (H - T - B);
+  const jobTop = Math.max(3, ...samples.map((s) => s.jobs || 0));
+  const yj = (v) => T + (1 - v / jobTop) * (H - T - B);
+  const line = (f, color, w = 2) => { const pts = samples.filter((s) => f(s) != null).map((s) => `${x(s.t).toFixed(1)},${f(s).toFixed(1)}`); return pts.length ? `<polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="${w}"/>` : ''; };
+  const grid = [0, 0.25, 0.5, 0.75, 1].map((p) => { const v = top * p; return `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="#eef0f4"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#6b7280">${MB(v)}</text>`; }).join('');
+  const ticks = [0, 0.5, 1].map((p) => { const t = t0 + (t1 - t0) * p; return `<text x="${x(t)}" y="${H - 6}" text-anchor="${p === 0 ? 'start' : p === 1 ? 'end' : 'middle'}" font-size="11" fill="#6b7280">${new Date(t * 1000).toTimeString().slice(0, 5)}</text>`; }).join('');
+  $('chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img"><title>资源曲线</title>${grid}${ticks}
+    <text x="${W - R + 6}" y="${T + 10}" font-size="11" fill="#059669">${Math.round(cpuTop)}%</text>
+    ${lim ? `<line x1="${L}" x2="${W - R}" y1="${y(lim)}" y2="${y(lim)}" stroke="#dc2626" stroke-dasharray="6 4"/>` : ''}
+    ${line((s) => (s.jobs != null ? yj(s.jobs) : null), '#f59e0b', 1.5)}
+    ${line((s) => (s.cpu != null ? yc(s.cpu) : null), '#059669', 1.5)}
+    ${line((s) => (s.rss != null ? y(s.rss + (s.child_rss || 0)) : null), '#7c3aed')}
+    ${line((s) => (s.cg_used != null ? y(s.cg_used) : null), '#2563eb')}</svg>
+    <div class="muted">${samples.length} 个采样，每 5 秒一次${lim ? '' : '；读不到容器内存上限，未画红线'}</div>`;
+}
+
+let n = 0, timer = 0;
+async function load() {
+  clearTimeout(timer);
+  try {
+    const r = await fetch('/api/ops/status', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const s = await r.json();
+    render(s);
+    if (n++ % 3 === 0) { const h = await (await fetch('/api/ops/history', { cache: 'no-store' })).json(); chart(h.samples || []); }
+    $('upd').textContent = '更新于 ' + new Date().toTimeString().slice(0, 8);
+  } catch (e) {
+    $('upd').innerHTML = `<span class="bad">读取失败：${esc(e.message)}（服务可能正在重启）</span>`;
+  }
+  if ($('auto').checked) timer = setTimeout(load, 5000);
+}
+$('refresh').onclick = () => { n = 0; load(); };
+$('auto').onchange = () => { if ($('auto').checked) load(); else clearTimeout(timer); };
+load();
+})();
+</script>
+</body>
+</html>

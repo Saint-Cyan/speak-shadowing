@@ -4,6 +4,7 @@
   GET  /api/health          健康检查
   GET  /api/voices          可选口音列表
   /api/media/*             视频 / 音频导入（见 media.py）
+  /ops、/api/ops/*         运维监控（见 ops.py）
   POST /api/tts             {"text": "...", "voice": "en-NZ-MollyNeural"}
                             返回 {"audio": base64 mp3, "words": [{"t": 起始ms, "d": 时长ms, "w": 单词}]}
 """
@@ -25,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from config import CONFIG
+import ops
 from media import router as media_router
 
 BASE = Path(__file__).parent
@@ -50,6 +52,24 @@ RATE_LIMIT = 90          # 每个 IP 每分钟最多请求数
 
 app = FastAPI(title="speak-tool")
 app.include_router(media_router)
+app.include_router(ops.router)
+
+
+@app.on_event("startup")
+async def _ops_start():
+    ops.start()
+
+
+@app.middleware("http")
+async def _count_requests(request: Request, call_next):
+    t0 = time.time()
+    status = 500
+    try:
+        resp = await call_next(request)
+        status = resp.status_code
+        return resp
+    finally:
+        ops.record_request(request.url.path, status, (time.time() - t0) * 1000)
 
 _cache: "OrderedDict[str, dict]" = OrderedDict()
 _hits: "defaultdict[str, deque]" = defaultdict(deque)
@@ -140,6 +160,11 @@ async def tts(req: TTSReq, request: Request):
 @app.get("/")
 async def index():
     return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/ops")
+async def ops_page():
+    return FileResponse(STATIC / "ops.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/sw.js")

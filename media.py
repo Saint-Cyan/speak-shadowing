@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from config import CONFIG
+from ops import event
 
 router = APIRouter(prefix="/api/media")
 
@@ -102,6 +103,8 @@ async def require_user(request: Request) -> str:
     if status == 200 and isinstance(data, dict):
         uid = str(data.get("sub") or data.get("uid") or data.get("id") or (data.get("user") or {}).get("id") or "")
         if uid:
+            if _auth_diag["mode"] != "verified":
+                event("auth_verified", "登录核实成功（严格模式）")
             _auth_diag.update(mode="verified", last_ok_at=time.time())
             _remember(key, uid, 300)
             return uid
@@ -109,6 +112,8 @@ async def require_user(request: Request) -> str:
     elif err is None:
         err = f"登录查询返回 HTTP {status}"
     # 方案 C：核实不了，按令牌里声明的用户 ID（未验证，仅用来区分各人的导入任务）放行
+    if _auth_diag["mode"] != "fallback":
+        event("auth_fallback", f"登录核实失败，退回分享码模式：{err[:300]}", "warn")
     _auth_diag.update(mode="fallback", last_error=err[:500], last_error_at=time.time())
     print(f"[media] login check failed, fallback to share-code mode: {err}", flush=True)
     uid = _jwt_sub(token) or f"ip:{ip}"
@@ -236,6 +241,7 @@ def _cleanup():
         if now - j["created"] > JOB_TTL:
             shutil.rmtree(_job_dir(jid), ignore_errors=True)
             _jobs.pop(jid, None)
+            event("job_expired", f"任务 {jid[:6]} 超过 {JOB_TTL // 3600} 小时，已清理")
 
 
 async def _run(*args: str) -> str:
@@ -296,8 +302,9 @@ async def _prepare(jid: str, src: Path, start_s: float, end_s: Optional[float]):
             chunks.append({"idx": i, "start_ms": round(a * 1000), "end_ms": round(b * 1000)})
         full.unlink(missing_ok=True)
         j.update(state="ready", message="", duration_ms=round(duration * 1000), chunks=chunks)
+        event("job_ready", f"任务 {jid[:6]} 音频就绪：{round(duration)} 秒，{len(chunks)} 段，用时 {round(time.time() - j['created'])} 秒")
     except Exception as e:  # noqa: BLE001
-        print(f"[media] job {jid} failed: {e}", flush=True)
+        event("job_error", f"任务 {jid[:6]} 音频处理失败：{str(e)[-300:]}", "error")
         j.update(state="error", message=f"音频处理失败：{str(e)[-200:]}")
 
 
@@ -336,9 +343,10 @@ async def _bili_download(jid: str, bvid: str, cid: int, start_s: float, end_s: O
                 raise RuntimeError(f"音频下载失败：{last}")
         await _prepare(jid, src, start_s, end_s)
     except HTTPException as e:
+        event("job_error", f"任务 {jid[:6]} 失败：{e.detail}", "error")
         j.update(state="error", message=str(e.detail))
     except Exception as e:  # noqa: BLE001
-        print(f"[media] job {jid} failed: {e}", flush=True)
+        event("job_error", f"任务 {jid[:6]} 失败：{str(e)[-300:]}", "error")
         j.update(state="error", message=str(e)[-200:])
 
 
@@ -353,6 +361,7 @@ def _new_job(uid: str, meta: dict) -> str:
     _job_dir(jid).mkdir(parents=True, exist_ok=True)
     _jobs[jid] = {"id": jid, "uid": uid, "created": time.time(), "state": "downloading", "message": "排队中…",
                   "duration_ms": None, "chunks": [], **meta}
+    event("job_created", f"任务 {jid[:6]} 已创建（{meta.get('source')}）")
     return jid
 
 
@@ -408,6 +417,8 @@ async def upload(request: Request, file: UploadFile = File(...), start_s: float 
 def _get_job(jid: str, uid: str) -> dict:
     j = _jobs.get(jid)
     if not j or j["uid"] != uid:
+        if not j:  # 这个进程里根本没有该任务：通常说明进程重启过，或请求落到了另一个实例
+            event("job_not_found", f"查询任务 {jid[:6]} 时本进程中不存在（已有 {len(_jobs)} 个任务）", "error")
         raise HTTPException(404, "导入任务不存在或已过期（服务重启后需要重新准备音频）")
     return j
 

@@ -3281,6 +3281,7 @@ async function renderAdmin(box) {
   box.innerHTML = `<div style="margin-top:10px;font-weight:500">管理员</div>
     ${models && models.length ? `<label class="fl" style="margin-top:6px">全员默认模型（没有单独选择模型的人都用它）
       <select data-def><option value="">平台默认（${esc(modelLabel((models || []).find((m) => m.isDefault) || models[0]))}）</option>${models.map(opt).join('')}</select></label>` : ''}
+    <div class="row" style="margin-top:10px"><a href="/ops" target="_blank" rel="noopener">🛠 运维监控（服务器内存、重启、导入任务）↗</a></div>
     <div class="row" style="margin-top:12px"><b style="flex:1">AI 调用统计（所有用户）</b><button data-refresh>刷新</button></div>
     <div data-stats class="muted">加载中…</div>`;
   const defSel = box.querySelector('[data-def]');
