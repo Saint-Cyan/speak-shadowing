@@ -1,0 +1,6 @@
+{
+  "cloud_endpoint": "https://your-app.app-tencent.workbuddy.host",
+  "cloud_publishable_key": "wbpk_xxxxxxxxxxxxxxxx",
+  "oauth_relay_url": "https://www.workbuddy.cn/v2/as/genie-baas/oauth",
+  "share_code": ""
+}
