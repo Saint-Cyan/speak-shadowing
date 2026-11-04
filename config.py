@@ -16,6 +16,9 @@ _KEYS = {
     "cloud_publishable_key": "SPEAK_CLOUD_PUBLISHABLE_KEY",
     "oauth_relay_url": "SPEAK_OAUTH_RELAY_URL",
     "share_code": "SPEAK_SHARE_CODE",
+    "tencent_secret_id": "SPEAK_TENCENT_SECRET_ID",    # 腾讯云语音识别 + 智聆口语评测（只在服务器上使用）
+    "tencent_secret_key": "SPEAK_TENCENT_SECRET_KEY",
+    "tencent_region": "SPEAK_TENCENT_REGION",
 }
 
 

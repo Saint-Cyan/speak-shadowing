@@ -39,7 +39,7 @@
 目前登录、数据库、文件存储、大模型都依赖 [WorkBuddy](https://www.workbuddy.cn) 的云服务（接口与 Supabase 类似）：
 
 - 大模型由浏览器免密钥调用，不需要自己的 API Key，但只能在 WorkBuddy 托管的域名下使用。
-- 「听音频」（发音分析、音视频转写）目前只有 Gemini 系列可用，且走的是把音频放进图片字段的非官方用法，单次约 60 秒上限，随时可能失效。
+- 「听音频」：配置了腾讯云密钥时，导入用腾讯云语音识别、发音分析用智聆口语评测；否则退回 Gemini（把音频放进图片字段的非官方用法，单次约 60 秒上限，随时可能失效）。
 - 后端（语音合成、B 站下载、切段）不依赖 WorkBuddy，任何能装 ffmpeg 的服务器都能跑。
 
 计划中的改造：AI 改为经本项目后端转发（自带 OpenAI 兼容接口 / Gemini 官方接口的密钥），数据与登录可切换到 Supabase。
@@ -66,6 +66,8 @@ ffmpeg：优先用系统里的 `ffmpeg`，没有时使用 `imageio-ffmpeg` 自�
 | `cloud_publishable_key` | `SPEAK_CLOUD_PUBLISHABLE_KEY` | 云服务公开配置（`wbpk_` 开头，会出现在浏览器里，不是密钥） |
 | `oauth_relay_url` | `SPEAK_OAUTH_RELAY_URL` | 微信等第三方登录的中转地址 |
 | `share_code` | `SPEAK_SHARE_CODE` | 托管网关的访问码，用于“添加到主屏幕”的启动地址（可选） |
+| `tencent_secret_id` / `tencent_secret_key` | `SPEAK_TENCENT_SECRET_ID` / `SPEAK_TENCENT_SECRET_KEY` | 腾讯云密钥（可选）。配置后：音视频导入用「录音文件识别」整段识别、自动区分说话人；发音分析用「智聆口语评测」逐音素打分。只在服务器上使用，建议用只授权这两项服务的子账号 |
+| `tencent_region` | `SPEAK_TENCENT_REGION` | 腾讯云地域，默认 `ap-shanghai` |
 | — | `PORT` | 监听端口，默认 3000 |
 | — | `MEDIA_DIR` | 导入时的临时目录，默认 `/tmp/speak-media` |
 

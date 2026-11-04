@@ -236,6 +236,14 @@ def _load_previous():
         pass
 
 
+def tencent_ok():
+    try:
+        import tencent
+        return tencent.enabled()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _jobs_summary():
     try:
         import media
@@ -247,10 +255,11 @@ def _jobs_summary():
             "by_state": {s: sum(1 for j in jobs if j["state"] == s) for s in ("downloading", "processing", "ready", "error")},
             "items": [{"id": j["id"][:6], "source": j.get("source"), "state": j["state"], "message": j.get("message") or "",
                        "age_s": round(now - j["created"]), "chunks": len(j.get("chunks") or []),
-                       "duration_ms": j.get("duration_ms")} for j in sorted(jobs, key=lambda x: -x["created"])[:20]],
+                       "duration_ms": j.get("duration_ms"), "engine": j.get("engine")} for j in sorted(jobs, key=lambda x: -x["created"])[:20]],
             "work_dir": str(media.WORK), "work_bytes": dir_size(media.WORK),
             "auth": {k: media._auth_diag.get(k) for k in ("mode", "last_error", "last_error_at", "last_ok_at")},
             "token_shapes": list(media._token_seen),
+            "tencent": tencent_ok(),
         }
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}

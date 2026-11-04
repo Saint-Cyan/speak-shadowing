@@ -32,6 +32,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+import tencent
 from config import CONFIG
 from ops import event
 
@@ -42,8 +43,11 @@ PUBLISHABLE_KEY = CONFIG["cloud_publishable_key"]  # 公开配置，不是密钥
 WORK = Path(os.environ.get("MEDIA_DIR", "/tmp/speak-media"))
 MAX_SECONDS = 2 * 3600        # 单次导入上限 2 小时
 MAX_UPLOAD = 300 * 1024 * 1024
-CHUNK_MAX = 55.0              # 每段最长秒数（模型约 60 秒上限，留余量）
+CHUNK_MAX = 55.0              # Gemini 听写时每段最长秒数（模型约 60 秒上限，留余量）
 CHUNK_MIN = 30.0              # 在 30–55 秒之间找停顿切开
+ASR_CHUNK_MAX = 180.0         # 腾讯云整段识别时，分段只用于保存原声，可以更长
+ASR_CHUNK_MIN = 90.0
+ASR_INLINE_MAX = 4_800_000    # 不超过约 4.8MB 的音频直接随请求提交，更大的让腾讯云按链接下载
 JOB_TTL = 12 * 3600
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 
@@ -270,21 +274,106 @@ async def _run(*args: str) -> str:
     return err.decode(errors="ignore")
 
 
-def _plan_chunks(duration: float, silences: list) -> list:
-    """在 30–55 秒之间找最长的停顿切开；找不到就在 55 秒硬切。返回 [(start, end)] 秒。"""
+def _plan_chunks(duration: float, silences: list, cmax: float = CHUNK_MAX, cmin: float = CHUNK_MIN) -> list:
+    """在 cmin–cmax 秒之间找最长的停顿切开；找不到就在 cmax 秒硬切。返回 [(start, end)] 秒。"""
     cuts, cur = [], 0.0
-    while duration - cur > CHUNK_MAX:
+    while duration - cur > cmax:
         best = None
         for s0, s1 in silences:
             mid = (s0 + s1) / 2
-            if cur + CHUNK_MIN <= mid <= cur + CHUNK_MAX and (best is None or (s1 - s0) > best[1]):
+            if cur + cmin <= mid <= cur + cmax and (best is None or (s1 - s0) > best[1]):
                 best = (mid, s1 - s0)
-        nxt = best[0] if best else cur + CHUNK_MAX
+        nxt = best[0] if best else cur + cmax
         cuts.append((cur, nxt))
         cur = nxt
     if duration - cur > 0.5 or not cuts:
         cuts.append((cur, duration))
     return cuts
+
+
+_PUNCT = set(",.?!;:")
+
+
+def _split_sentences(detail: list) -> list:
+    """把腾讯云的识别结果（按说话人 / 停顿成段，带词级时间戳）按句末标点再切成适合跟读的句子。"""
+    out = []
+    for it in detail or []:
+        base = int(it.get("StartMs") or 0)
+        sp = int(it.get("SpeakerId") or 0)
+        words = it.get("Words") or []
+        if not words:
+            text = (it.get("FinalSentence") or "").strip()
+            if text:
+                out.append({"s": base, "e": int(it.get("EndMs") or base), "sp": sp, "t": text})
+            continue
+        cur, n_words = [], 0
+
+        def flush():
+            nonlocal cur, n_words
+            toks = [w for w in cur if (w.get("Word") or "").strip()]
+            if not toks:
+                cur, n_words = [], 0
+                return
+            text = ""
+            for w in toks:
+                t = w["Word"].strip()
+                text += t if (t in _PUNCT or not text) else " " + t
+            real = [w for w in toks if w["Word"].strip() not in _PUNCT]
+            if real:
+                out.append({"s": base + int(real[0].get("OffsetStartMs") or 0), "e": base + int(real[-1].get("OffsetEndMs") or 0),
+                            "sp": sp, "t": text.strip()})
+            elif out:
+                out[-1]["t"] += text.strip()
+            cur, n_words = [], 0
+
+        for w in words:
+            t = (w.get("Word") or "").strip()
+            cur.append(w)
+            if t and t not in _PUNCT:
+                n_words += 1
+            if (t in (".", "?", "!") and n_words >= 3) or (t in (",", ";") and n_words >= 30):
+                flush()
+        flush()
+    return [x for x in out if re.search(r"[A-Za-z]", x["t"])]
+
+
+async def _tencent_asr(jid: str, full: Path, duration: float) -> list:
+    j = _jobs[jid]
+    size = full.stat().st_size
+    j.update(state="processing", message="腾讯云语音识别：提交中…")
+    if size <= ASR_INLINE_MAX:
+        raw = full.read_bytes()
+        task = await tencent.asr_create(data_b64=base64.b64encode(raw).decode(), data_len=len(raw))
+        how = "直接提交"
+    else:
+        url = f"{CLOUD_ENDPOINT}/api/media/jobs/{jid}/full.mp3?k={j['key']}"
+        if CONFIG.get("share_code"):
+            url += f"&sharecode={CONFIG['share_code']}"
+        task = await tencent.asr_create(url=url)
+        how = "链接下载"
+    event("asr_submitted", f"任务 {jid[:6]} 已提交腾讯云识别（{round(duration)} 秒，{size >> 10}KB，{how}）")
+    t0 = time.time()
+    while True:
+        await asyncio.sleep(3)
+        try:
+            d = await tencent.asr_status(task)
+        except tencent.TencentError as e:
+            if time.time() - t0 > 3 * 3600:
+                raise
+            print(f"[media] asr status error: {e}", flush=True)
+            continue
+        st = d.get("StatusStr")
+        waited = round(time.time() - t0)
+        if st == "success":
+            sents = _split_sentences(d.get("ResultDetail"))
+            j["asr_ms"] = round((time.time() - t0) * 1000)
+            event("asr_done", f"任务 {jid[:6]} 腾讯云识别完成：{len(sents)} 句，{len({x['sp'] for x in sents})} 位说话人，用时 {waited} 秒")
+            return sents
+        if st == "failed":
+            raise RuntimeError(d.get("ErrorMsg") or "识别失败")
+        j["message"] = f"腾讯云语音识别中…（已等待 {waited} 秒；1 小时音频一般 1–3 分钟）"
+        if time.time() - t0 > 3 * 3600:
+            raise RuntimeError("识别超过 3 小时仍未完成")
 
 
 async def _prepare(jid: str, src: Path, start_s: float, end_s: Optional[float]):
@@ -312,7 +401,16 @@ async def _prepare(jid: str, src: Path, start_s: float, end_s: Optional[float]):
         starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", log)]
         ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", log)]
         silences = list(zip(starts, ends))
-        plan = _plan_chunks(duration, silences)
+        engine = "gemini"
+        if tencent.enabled():
+            try:
+                j["sentences"] = await _tencent_asr(jid, full, duration)
+                engine = "tencent"
+            except Exception as e:  # noqa: BLE001
+                j["asr_error"] = str(e)[-300:]
+                event("asr_failed", f"任务 {jid[:6]} 腾讯云识别失败，改用 Gemini 逐段听写：{str(e)[-200:]}", "error")
+        j["engine"] = engine
+        plan = _plan_chunks(duration, silences, ASR_CHUNK_MAX, ASR_CHUNK_MIN) if engine == "tencent" else _plan_chunks(duration, silences)
         j.update(message=f"正在切分为 {len(plan)} 段…")
         chunks = []
         for i, (a, b) in enumerate(plan):
@@ -320,7 +418,7 @@ async def _prepare(jid: str, src: Path, start_s: float, end_s: Optional[float]):
             chunks.append({"idx": i, "start_ms": round(a * 1000), "end_ms": round(b * 1000)})
         full.unlink(missing_ok=True)
         j.update(state="ready", message="", duration_ms=round(duration * 1000), chunks=chunks)
-        event("job_ready", f"任务 {jid[:6]} 音频就绪：{round(duration)} 秒，{len(chunks)} 段，用时 {round(time.time() - j['created'])} 秒")
+        event("job_ready", f"任务 {jid[:6]} 音频就绪：{round(duration)} 秒，{len(chunks)} 段（{engine}），用时 {round(time.time() - j['created'])} 秒")
     except Exception as e:  # noqa: BLE001
         event("job_error", f"任务 {jid[:6]} 音频处理失败：{str(e)[-300:]}", "error")
         j.update(state="error", message=f"音频处理失败：{str(e)[-200:]}")
@@ -450,7 +548,30 @@ async def job_status(jid: str, request: Request):
     if not _ip_rate_ok(_client_ip(request)):
         raise HTTPException(429, "请求太频繁，请稍后再试")
     j = _get_job(jid, request)
-    return {k: j[k] for k in ("id", "state", "message", "duration_ms", "chunks", "source", "title")}
+    out = {k: j[k] for k in ("id", "state", "message", "duration_ms", "chunks", "source", "title")}
+    out.update(engine=j.get("engine"), asr_error=j.get("asr_error"), asr_ms=j.get("asr_ms"))
+    return out
+
+
+@router.get("/jobs/{jid}/transcript")
+async def job_transcript(jid: str, request: Request):
+    j = _get_job(jid, request)
+    if j.get("engine") != "tencent":
+        raise HTTPException(404, "这个任务没有整段识别结果")
+    return {"sentences": j.get("sentences") or []}
+
+
+@router.get("/jobs/{jid}/full.mp3")
+async def job_full(jid: str, k: str = ""):
+    """给腾讯云按链接下载整段音频用：凭任务凭证访问（放在查询参数里，腾讯云无法带请求头）。"""
+    j = _jobs.get(jid)
+    if not j or not k or not secrets.compare_digest(k, j["key"]):
+        raise HTTPException(404, "not found")
+    p = _job_dir(jid) / "full.mp3"
+    if not p.exists():
+        raise HTTPException(404, "not found")
+    event("asr_fetch", f"任务 {jid[:6]} 的整段音频被下载（腾讯云识别）")
+    return FileResponse(p, media_type="audio/mpeg")
 
 
 @router.get("/jobs/{jid}/chunks/{idx}")
@@ -464,3 +585,45 @@ async def job_chunk(jid: str, idx: int, request: Request):
     if not p.exists():
         raise HTTPException(404, "这一段音频已被清理，请重新导入")
     return FileResponse(p, media_type="audio/mpeg")
+
+
+# ---------------- 发音评测：腾讯云智聆口语评测 ----------------
+pron_router = APIRouter(prefix="/api/pron")
+
+
+class PronReq(BaseModel):
+    ref_text: str
+    wav_b64: str
+
+
+@pron_router.post("/assess")
+async def pron_assess(req: PronReq, request: Request):
+    await require_user(request)
+    if not tencent.enabled():
+        raise HTTPException(503, "NotConfigured: 服务器没有配置腾讯云密钥")
+    ref = " ".join(req.ref_text.split())
+    n = len(re.findall(r"[A-Za-z0-9']+", ref))
+    if not n:
+        raise HTTPException(400, "句子里没有英文单词")
+    if n > 120:
+        raise HTTPException(400, "句子太长（口语评测最多 120 个单词）")
+    if len(req.wav_b64) > 4_000_000:
+        raise HTTPException(413, "录音太长（口语评测最多约 90 秒）")
+    t0 = time.time()
+    try:
+        r = await tencent.soe_eval(ref, req.wav_b64, uuid.uuid4().hex, eval_mode=1 if n <= 30 else 2)
+    except tencent.TencentError as e:
+        event("soe_error", f"口语评测失败：{e.code} {e.message[:200]}", "error")
+        raise HTTPException(502, f"{e.code}: {e.message}")
+    tags = {0: "ok", 1: "inserted", 2: "missing", 3: "mispronounced", 4: "unknown"}
+    words = []
+    for w in r.get("Words") or []:
+        phones = [{"p": ph.get("Phone"), "ref": ph.get("ReferencePhone"), "letter": ph.get("ReferenceLetter"),
+                   "score": round(ph.get("PronAccuracy") or 0), "stress": ph.get("Stress"), "detected_stress": ph.get("DetectedStress")}
+                  for ph in (w.get("PhoneInfos") or [])]
+        words.append({"w": w.get("ReferenceWord") or w.get("Word"), "heard": w.get("Word"), "score": round(w.get("PronAccuracy") or 0),
+                      "tag": tags.get(w.get("MatchTag"), "unknown"), "phones": phones})
+    pct = lambda x: None if x is None or x < 0 else round(x * 100)  # noqa: E731
+    return {"overall": round(r.get("SuggestedScore") or 0), "accuracy": round(r.get("PronAccuracy") or 0),
+            "fluency": pct(r.get("PronFluency")), "completeness": pct(r.get("PronCompletion")),
+            "words": words, "ms": round((time.time() - t0) * 1000)}

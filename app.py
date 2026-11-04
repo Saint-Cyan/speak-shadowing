@@ -27,6 +27,8 @@ from pydantic import BaseModel
 
 from config import CONFIG
 import ops
+import tencent
+from media import pron_router
 from media import router as media_router
 
 BASE = Path(__file__).parent
@@ -52,6 +54,7 @@ RATE_LIMIT = 90          # 每个 IP 每分钟最多请求数
 
 app = FastAPI(title="speak-tool")
 app.include_router(media_router)
+app.include_router(pron_router)
 app.include_router(ops.router)
 
 
@@ -178,7 +181,7 @@ async def sw():
 async def config_js():
     # 浏览器端需要的公开配置（不含任何密钥）
     pub = {"cloudEndpoint": CONFIG["cloud_endpoint"], "cloudPublishableKey": CONFIG["cloud_publishable_key"],
-           "oauthRelayUrl": CONFIG["oauth_relay_url"]}
+           "oauthRelayUrl": CONFIG["oauth_relay_url"], "speechEngine": "tencent" if tencent.enabled() else ""}
     body = "window.APP_CONFIG = " + json.dumps(pub, ensure_ascii=False) + ";\n"
     return Response(body, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
 

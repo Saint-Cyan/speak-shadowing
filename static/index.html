@@ -1656,7 +1656,7 @@ async function saveFlow(items, meta) {
 }
 
 /* ================= AI：模型、调用与用量记录 ================= */
-const AI_KIND = { gen_dialogue: '场景生成对话', revise_dialogue: '修改整段对话', rewrite_line: '按意见改写', review_line: '句子点评', vocab: '难词解析', word_lookup: '查单词释义', pron_listen: '发音分析·听', pron_coach: '发音分析·讲解', media_transcribe: '导入·转写', media_organize: '导入·整理翻译' };
+const AI_KIND = { gen_dialogue: '场景生成对话', revise_dialogue: '修改整段对话', rewrite_line: '按意见改写', review_line: '句子点评', vocab: '难词解析', word_lookup: '查单词释义', pron_listen: '发音分析·听', pron_coach: '发音分析·讲解', media_transcribe: '导入·转写', media_organize: '导入·整理翻译', media_speakers: '导入·推断说话人' };
 let models = null;
 let appDefaultModel = null;
 const isChatModel = (m) => m && m.disabled !== true && m.enabled !== false && m.maxOutputTokens; // 过滤掉图片 / 视频模型
@@ -1717,7 +1717,7 @@ async function aiCall(kind, user, { onProgress, signal, model: forced, system } 
     if (!content.trim()) { errCode = 'empty'; throw new Error('模型没有返回内容，请重试或换个模型'); }
     return { text: content, model };
   } catch (e) {
-    if (!errCode) errCode = e.name === 'AbortError' ? 'aborted' : String((e.error && e.error.code) || e.code || e.name || 'error').slice(0, 100);
+    if (!errCode) errCode = e.name === 'AbortError' ? 'aborted' : String([(e.error && e.error.code) || e.code || e.name || 'error', (e.error && e.error.message) || e.message, e.requestId && 'rid=' + e.requestId].filter(Boolean).join(' | ')).slice(0, 100);
     throw e.name === 'AbortError' ? new Stopped() : new Error(e instanceof Error && !e.error ? e.message : aiErrMsg(e));
   } finally {
     logCall({
@@ -2140,6 +2140,12 @@ const recCountText = (ids) => {
   return n ? `\n这些句子的 ${n} 条历史录音也会一起删除。` : '';
 };
 const extOf = (mime) => (/mp4|m4a|aac/.test(mime) ? 'm4a' : /webm/.test(mime) ? 'webm' : /ogg/.test(mime) ? 'ogg' : 'audio');
+// 云存储写入：文件已存在时改用替换（upsert 参数在这个云存储上不生效）
+async function storagePut(path, blob, mime) {
+  const up = await cloud.storage.upload(path, blob, { contentType: mime, upsert: false });
+  if (up.error && /exist/i.test(String(up.error.message || up.error.code || ''))) return cloud.storage.update(path, blob, { contentType: mime });
+  return up;
+}
 async function saveRecording(s, blob, durMs, source, localUrl) {
   if (listKind !== 'dialogue' || !curDialogue || !s.id || !cloud) return;
   if (!session) { setStatus(s, '已录音（未登录，不会保存历史）'); return; }
@@ -2150,7 +2156,7 @@ async function saveRecording(s, blob, durMs, source, localUrl) {
     const mime = (blob.type || 'audio/mp4').split(';')[0];
     const rnd = Math.random().toString(36).slice(2, 8);
     path = cloud.storage.userPath(session.user.id, `rec/${lineId}/${Date.now()}-${rnd}.${extOf(mime)}`);
-    const up = await cloud.storage.upload(path, blob, { contentType: mime, upsert: false });
+    const up = await storagePut(path, blob, mime);
     if (up.error) throw new Error(up.error.message || '上传失败');
     const [row] = await api.insert('recordings', { dialogue_id: did, line_id: lineId, path, mime, size_bytes: blob.size,
       duration_ms: Math.round(durMs), source, line_text: text.slice(0, 1000) });
@@ -2241,6 +2247,20 @@ Listen to the recording carefully.
 2. "words": every target word that was mispronounced, unclear, missing, added or wrongly stressed. Only real problems; an empty list is fine if it sounded native-like.
 JSON shape: {"heard":"...","overall":0-100,"fluency":0-100,"completeness":0-100,"words":[{"w":"target word exactly as in the sentence","score":0-100,"heard_as":"what it sounded like","issue":"English: which sound or stress was off"}],"notes":"English: intonation, pace, linking; may be empty"}`;
 }
+const engineLabel = (id) => (id === 'tencent-soe' ? '腾讯云智聆口语评测' : id === 'tencent-asr' ? '腾讯云语音识别' : modelById(id) ? modelLabel(modelById(id)) : id || '');
+// 把腾讯云口语评测结果转成讲解模型使用的格式：只保留有问题的词和音素
+function soeToListen(r) {
+  const words = [];
+  (r.words || []).forEach((w) => {
+    const badPh = (w.phones || []).filter((p) => p.score < 70 || (p.stress != null && p.detected_stress != null && p.stress !== p.detected_stress));
+    if (w.tag === 'ok' && w.score >= 80 && !badPh.length) return;
+    const issue = w.tag === 'missing' ? 'word was skipped' : w.tag === 'inserted' ? 'extra word inserted' :
+      badPh.map((p) => `/${p.ref || p.p}/${p.letter ? ` (letter "${p.letter}")` : ''} scored ${p.score}${p.p && p.ref && p.p !== p.ref ? `, sounded like /${p.p}/` : ''}${p.stress != null && p.detected_stress != null && p.stress !== p.detected_stress ? (p.stress ? ', should be stressed' : ', should not be stressed') : ''}`).join('; ');
+    words.push({ w: w.w, score: w.score, heard_as: w.tag === 'mispronounced' && w.heard && w.heard !== w.w ? w.heard : null, issue: issue || `overall accuracy ${w.score}` });
+  });
+  return { heard: null, overall: r.overall, fluency: r.fluency, completeness: r.completeness,
+    words: words.slice(0, 12), notes: `phoneme-level assessment by Tencent SOE; sentence accuracy ${r.accuracy}` };
+}
 function promptPronCoach(ref, listen) {
   return `A pronunciation examiner listened to a Chinese software engineer reading this sentence: ${fence(ref)}
 Examiner's findings (JSON): ${fence(JSON.stringify(listen))}
@@ -2315,18 +2335,19 @@ function analysisHtml(a, s) {
     ${(c.contrast || []).length ? `<h4>对比练习</h4>${c.contrast.map((x) => `<div class="pcard"><b>${esc(x.a)}</b> ${pb(x.a)} vs <b>${esc(x.b)}</b> ${pb(x.b)}<div class="muted">${esc(x.tip || '')}</div></div>`).join('')}` : ''}
     ${(c.practice || []).length ? `<h4>跟读这些</h4>${c.practice.map((x) => `<div class="pcard">${esc(x)} ${pb(x)} ${pb(x, 0.75).replace('▶', '🐢')}</div>`).join('')}` : ''}
     ${a.notes ? `<div class="muted" style="margin-top:6px">评测备注：${esc(a.notes)}</div>` : ''}
-    <div class="muted" style="font-size:12px;margin-top:8px">粗略分析：${esc(modelLabel(modelById(a.listen_model)) || a.listen_model)} 听录音判断，${esc(modelLabel(modelById(a.coach_model)) || a.coach_model || '')} 写讲解。细微的元音、重音问题可能漏掉，仅供参考。</div>`;
+    <div class="muted" style="font-size:12px;margin-top:8px">${a.listen_model === 'tencent-soe' ? `腾讯云智聆口语评测逐个音素打分，${esc(engineLabel(a.coach_model))} 写讲解。` : `粗略分析：${esc(engineLabel(a.listen_model))} 听录音判断，${esc(engineLabel(a.coach_model))} 写讲解。细微的元音、重音问题可能漏掉，仅供参考。`}</div>`;
 }
 async function openPronAnalysis(s, row) {
   if (!(await aiReady())) return;
   const listenM = modelById(LISTEN_MODEL);
+  let useSoe = appCfg.speechEngine === 'tencent';
   const ctl = openModal(`<h3>🔍 发音分析</h3><div class="muted">${fmtTime(row.created_at)} 的录音${row.line_text && row.line_text !== s.text ? '（录音时句子和现在不同，按录音时的句子分析）' : ''}</div>
     <div class="row" style="margin-top:8px"><button type="button" data-mine>▶ 我的录音</button><button type="button" data-cmp>⇄ 先原音再我的</button></div>
     <div data-res class="outbox"></div>
     <form class="f" novalidate>
-      <div class="muted">听录音：${listenM ? esc(modelLabel(listenM)) : '<span class="err">当前没有可以听音频的模型</span>'}（目前只有它能听）</div>
+      <div class="muted">听录音：${useSoe ? '腾讯云智聆口语评测（逐个音素打分）' : listenM ? esc(modelLabel(listenM)) + '（粗略判断）' : '<span class="err">当前没有可以听音频的模型</span>'}</div>
       ${modelHint().replace('使用的模型', '写讲解的模型')}
-      <div class="row end"><button type="button" class="ghost" data-x>关闭</button><button type="submit" class="primary"${listenM ? '' : ' disabled'}>${row.analysis ? '重新分析' : '开始分析'}</button></div>
+      <div class="row end"><button type="button" class="ghost" data-x>关闭</button><button type="submit" class="primary"${listenM || useSoe ? '' : ' disabled'}>${row.analysis ? '重新分析' : '开始分析'}</button></div>
     </form>
     <div data-out></div>`);
   const res = ctl.m.querySelector('[data-res]'), out = ctl.m.querySelector('[data-out]'), f = ctl.m.querySelector('form');
@@ -2350,12 +2371,28 @@ async function openPronAnalysis(s, row) {
       if (!blob) throw new Error('录音下载失败');
       const b64 = await toWav16kBase64(blob);
       const t0 = Date.now();
-      step(`① ${modelLabel(listenM)} 正在听录音…`);
-      const L = await aiCall('pron_listen', [{ type: 'text', text: promptListen(ref) }, { type: 'image_url', image_url: { url: 'data:audio/wav;base64,' + b64 } }], {
-        model: listenM, system: LISTEN_SYS, signal: ac.signal,
-        onProgress: () => { const sp = out.querySelector('span'); if (sp) sp.textContent = `① ${modelLabel(listenM)} 正在听录音… ${Math.round((Date.now() - t0) / 1000)}s`; },
-      });
-      const listen = cleanListen(parseJSON(L.text));
+      let listen = null, listenId = null;
+      if (useSoe) {
+        step('① 腾讯云口语评测打分中…');
+        try {
+          const r = await backend('/api/pron/assess', { method: 'POST', body: JSON.stringify({ ref_text: ref, wav_b64: b64 }), signal: ac.signal });
+          listen = soeToListen(r); listenId = 'tencent-soe';
+          logCall({ kind: 'pron_listen', model: 'tencent-soe', ok: true, duration_ms: Date.now() - t0 });
+        } catch (e) {
+          if (ac.signal.aborted) throw new Stopped();
+          logCall({ kind: 'pron_listen', model: 'tencent-soe', ok: false, error_code: String(e.message).slice(0, 100), duration_ms: Date.now() - t0 });
+          if (!listenM) throw e;
+          toast((/AccountUnavailable/.test(e.message) ? '腾讯云口语评测还没开通' : '腾讯云口语评测失败') + '，这次改用 Gemini 粗略分析', 4500);
+        }
+      }
+      if (!listen) {
+        step(`① ${modelLabel(listenM)} 正在听录音…`);
+        const L = await aiCall('pron_listen', [{ type: 'text', text: promptListen(ref) }, { type: 'image_url', image_url: { url: 'data:audio/wav;base64,' + b64 } }], {
+          model: listenM, system: LISTEN_SYS, signal: ac.signal,
+          onProgress: () => { const sp = out.querySelector('span'); if (sp) sp.textContent = `① ${modelLabel(listenM)} 正在听录音… ${Math.round((Date.now() - t0) / 1000)}s`; },
+        });
+        listen = cleanListen(parseJSON(L.text)); listenId = listenM.id;
+      }
       const coachM = currentModel();
       const t1 = Date.now();
       step(`② ${modelLabel(coachM)} 正在写讲解…`);
@@ -2363,7 +2400,7 @@ async function openPronAnalysis(s, row) {
         signal: ac.signal,
         onProgress: () => { const sp = out.querySelector('span'); if (sp) sp.textContent = `② ${modelLabel(coachM)} 正在写讲解… ${Math.round((Date.now() - t1) / 1000)}s`; },
       });
-      const analysis = Object.assign(listen, { coach: cleanCoach(parseJSON(C.text)), listen_model: listenM.id, coach_model: C.model.id, at: new Date().toISOString(), v: 1 });
+      const analysis = Object.assign(listen, { coach: cleanCoach(parseJSON(C.text)), listen_model: listenId, coach_model: C.model.id, at: new Date().toISOString(), v: 1 });
       await api.update('recordings', row.id, { analysis });
       row.analysis = analysis;
       out.innerHTML = ''; show(); btn.textContent = '重新分析';
@@ -2414,7 +2451,8 @@ function uploadWithProgress(file, startS, endS, onProg) {
 /* ---------- 导入弹窗 ---------- */
 async function openImport() {
   if (!(await aiReady())) return;
-  if (!modelById(LISTEN_MODEL)) return toast('当前没有可以听音频的模型，暂时无法导入');
+  const useTencent = appCfg.speechEngine === 'tencent';
+  if (!useTencent && !modelById(LISTEN_MODEL)) return toast('当前没有可以听音频的模型，暂时无法导入');
   const o = LS.get('impOpts', { seg: '5', translate: true });
   const ctl = openModal(`<h3>📥 导入视频 / 音频</h3>
     <div class="muted">导入到话题「${esc(curTopic ? curTopic.title : '')}」，转写后按时间切成若干段对话。单次最长 2 小时。</div>
@@ -2438,7 +2476,7 @@ async function openImport() {
       <label class="fl">每段对话大约<select data-seg><option value="3">3 分钟</option><option value="5">5 分钟</option><option value="10">10 分钟</option><option value="20">20 分钟</option></select></label>
       <label class="chk" style="display:flex;gap:6px;align-items:center;font-size:14px"><input type="checkbox" data-tr> 生成中文翻译、标题和重点表达</label>
       <div data-trmodel>${modelHint().replace('使用的模型', '翻译整理用的模型')}</div>
-      <div class="muted">听写固定用 ${esc(modelLabel(modelById(LISTEN_MODEL)))}（目前只有它能听音频），每次最多听约 55 秒，所以会分很多次调用。</div>
+      <div class="muted">${useTencent ? '语音识别用腾讯云：整段一次识别，自动区分说话人、带精确时间轴；之后用上面的模型推断说话人名字。' : `听写固定用 ${esc(modelLabel(modelById(LISTEN_MODEL)))}（目前只有它能听音频），每次最多听约 55 秒，所以会分很多次调用。`}</div>
       <div class="muted" data-est></div>
       <div class="err"></div>
       <div class="row end"><button type="button" class="ghost" data-x>取消</button><button type="button" class="primary" data-go>开始导入</button></div>
@@ -2467,6 +2505,14 @@ async function openImport() {
   function est() {
     const sec = totalSeconds(), el = m.querySelector('[data-est]');
     m.querySelector('[data-rangehint]').textContent = src === 'bili' && pickedPages().length > 1 ? '选了多个分 P：每个分 P 整集导入，时间段不生效。' : '只导入其中一段可以省时间和积分。';
+    const trOn = m.querySelector('[data-tr]').checked;
+    if (useTencent) {
+      if (sec == null) { el.textContent = '本地文件的时长要上传后才知道。腾讯云按音频时长计费（每月有免费额度）。'; return; }
+      if (!sec) { el.textContent = ''; return; }
+      const segs = Math.max(1, Math.round(sec / 60 / +m.querySelector('[data-seg]').value));
+      el.innerHTML = `预计：音频 ${esc(mmss(sec * 1000))}，腾讯云识别 1 次（按时长计费）+ 1 次推断说话人${trOn ? ` + ${segs} 次翻译整理` : ''}；识别 1 小时音频一般 1–3 分钟。${sec > MAX_IMPORT_S ? '<span class="err">超过 2 小时，请缩短范围。</span>' : ''}`;
+      return;
+    }
     if (sec == null) { el.textContent = '本地文件的时长要上传后才知道：大约每分钟音频 1–2 次听写调用。'; return; }
     if (!sec) { el.textContent = ''; return; }
     const listen = Math.ceil(sec / 48), segs = Math.max(1, Math.round(sec / 60 / +m.querySelector('[data-seg]').value));
@@ -2653,7 +2699,7 @@ async function processSource(id, signal) {
   const src = (await q(T().from('media_sources').select('*').eq('id', id).maybeSingle()));
   if (!src) throw new Error('导入记录已不存在');
   const listenM = modelById(LISTEN_MODEL);
-  if (!listenM) throw new Error('当前没有可以听音频的模型');
+  let tx = null; // 腾讯云整段识别的句子（绝对时间，毫秒）
   await setSourceStatus(id, { status: 'transcribing', error: null });
   // 已完成的分段（断点续传）
   const done = await q(T().from('media_chunks').select('idx,start_ms,end_ms,path,transcript').eq('source_id', id).order('idx', { ascending: true }));
@@ -2671,6 +2717,13 @@ async function processSource(id, signal) {
     }
     await setSourceStatus(id, { chunks_total: chunks.length, duration_ms: st.duration_ms, chunks_done: done.length });
     src.chunks_total = chunks.length;
+    if (st.engine === 'tencent') {
+      tx = ((await jobGet(jid, '/transcript')).sentences || []).map((x) => ({ s: x.s, e: x.e, sp: `Speaker ${Number(x.sp) + 1}`, t: String(x.t).slice(0, 1000) }));
+      logCall({ kind: 'media_transcribe', model: 'tencent-asr', ok: true, duration_ms: st.asr_ms || null });
+    } else {
+      if (st.asr_error) toast('腾讯云识别失败，改用 Gemini 逐段听写：' + st.asr_error, 5000);
+      if (!listenM) throw new Error('当前没有可以听音频的模型');
+    }
   }
   const doneIdx = new Set(done.map((c) => c.idx));
   let speakers = Array.isArray(src.speakers) ? src.speakers.slice() : [];
@@ -2680,12 +2733,21 @@ async function processSource(id, signal) {
     for (const c of chunks) {
       if (doneIdx.has(c.idx)) continue;
       chk(signal);
-      mediaProgress(id, `${modelLabel(listenM)} 听写中… ${doneIdx.size}/${chunks.length}（${mmss(c.start_ms)}）`, Math.round(doneIdx.size * 100 / chunks.length));
+      mediaProgress(id, tx ? `保存原声… ${doneIdx.size}/${chunks.length}` : `${modelLabel(listenM)} 听写中… ${doneIdx.size}/${chunks.length}（${mmss(c.start_ms)}）`, Math.round(doneIdx.size * 100 / chunks.length));
       const res = await jobGet(jid, `/chunks/${c.idx}`, true);
       const blob = await res.blob();
       const path = cloud.storage.userPath(session.user.id, `media/${id}/${c.idx}.mp3`);
-      const up = await cloud.storage.upload(path, blob, { contentType: 'audio/mpeg', upsert: true });
+      const up = await storagePut(path, blob, 'audio/mpeg');
       if (up.error) throw new Error('原声保存失败：' + (up.error.message || ''));
+      if (tx) { // 腾讯云整段识别：直接取落在这一段里的句子，不再逐段调用模型
+        const utt = tx.filter((x) => x.s >= c.start_ms && x.s < c.end_ms).map((x) => ({ s: x.s - c.start_ms, e: Math.min(x.e, c.end_ms) - c.start_ms, sp: x.sp, t: x.t }));
+        utt.forEach((u) => { if (!speakers.includes(u.sp)) speakers.push(u.sp); });
+        await q(T().from('media_chunks').upsert({ source_id: id, idx: c.idx, start_ms: c.start_ms, end_ms: c.end_ms, path, transcript: { utterances: utt } }, { onConflict: 'source_id,idx' }).select('id'));
+        done.push({ idx: c.idx, start_ms: c.start_ms, end_ms: c.end_ms, path, transcript: { utterances: utt } });
+        doneIdx.add(c.idx);
+        await setSourceStatus(id, { chunks_done: doneIdx.size, speakers: speakers.slice(0, 30) });
+        continue;
+      }
       const b64 = await blobToB64(blob);
       const durMs = c.end_ms - c.start_ms;
       let utt = null, lastErr = null;
@@ -2711,6 +2773,35 @@ async function processSource(id, signal) {
     }
   }
   await organizeSource(src, done.sort((a, b) => a.idx - b.idx), signal);
+}
+// 腾讯云只给出“说话人 1/2/3”：用一次 AI 调用，根据内容推断名字（Anna、Narrator…），推断不出就保留原样
+async function nameSpeakers(src, utts, signal) {
+  const ids = [...new Set(utts.map((u) => u.sp))];
+  if (!ids.some((x) => /^Speaker \d+$/.test(x))) return;
+  const opts = src.options || {};
+  let map = opts.speaker_names;
+  if (!map) {
+    const sample = [];
+    ids.forEach((sp) => utts.filter((u) => u.sp === sp).slice(0, 8).forEach((u) => sample.push(u)));
+    const ordered = utts.slice(0, 60);
+    try {
+      mediaProgress(src.id, '识别说话人名字…');
+      const r = await aiCall('media_speakers', `Speech recognition split this recording from ${fence(src.title)} into anonymous speakers.
+Opening lines in order (JSON): ${fence(JSON.stringify(ordered.map((u) => ({ s: u.sp, t: u.t }))))}
+More lines per speaker (JSON): ${fence(JSON.stringify(sample.map((u) => ({ s: u.sp, t: u.t }))))}
+For each speaker label, give the person's name if it can be inferred from the content (names said by others, self-introductions), "Narrator" for a narrator/host voice-over, otherwise keep the label. Keep it short (max 20 chars).
+JSON shape: {"names":{"Speaker 1":"..."}}`, { signal });
+      const j = parseJSON(r.text);
+      map = {};
+      ids.forEach((sp) => { const v = j.names && j.names[sp]; map[sp] = v ? String(v).trim().slice(0, 30) || sp : sp; });
+    } catch (e) {
+      if (e instanceof Stopped) throw e;
+      map = Object.fromEntries(ids.map((x) => [x, x]));
+    }
+    opts.speaker_names = map;
+    await setSourceStatus(src.id, { options: opts, speakers: [...new Set(Object.values(map))].slice(0, 30) });
+  }
+  utts.forEach((u) => { if (map[u.sp]) u.sp = map[u.sp]; });
 }
 function promptOrganize(title, items) {
   return `These are consecutive lines transcribed from ${fence(title)} (English listening material that a Chinese software engineer will use for speaking practice).
@@ -2748,6 +2839,7 @@ async function organizeSource(src, chunks, signal) {
     sp: u.sp, t: u.t, abs: c.start_ms + u.s, absEnd: c.start_ms + u.e, src: { path: c.path, s: u.s, e: u.e },
   })));
   if (!utts.length) throw new Error('没有听写出英文内容（可能是纯音乐或非英语）');
+  await nameSpeakers(src, utts, signal);
   const segs = splitSegments(utts, (opts.seg || 5) * 60000);
   const existing = await q(T().from('dialogues').select('id,position').eq('source_id', id));
   const startSeg = (opts.segments_done || 0);
