@@ -20,6 +20,7 @@ _KEYS = {
     "tencent_secret_id": "SPEAK_TENCENT_SECRET_ID",    # 腾讯云语音识别 + 智聆口语评测（只在服务器上使用）
     "tencent_secret_key": "SPEAK_TENCENT_SECRET_KEY",
     "tencent_region": "SPEAK_TENCENT_REGION",
+    "tencent_appid": "SPEAK_TENCENT_APPID",            # 账号 AppID（新版口语评测用），不填会自动查询
 }
 
 

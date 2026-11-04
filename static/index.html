@@ -2430,7 +2430,7 @@ async function openPronAnalysis(s, row) {
       } catch (e) {
         if (ac.signal.aborted) throw new Stopped();
         logCall({ kind: 'pron_listen', model: 'tencent-soe', ok: false, error_code: String(e.message).slice(0, 100), duration_ms: Date.now() - t0 });
-        throw new Error(/AccountUnavailable/.test(e.message) ? '腾讯云账号还没开通“智聆口语评测”，请到腾讯云控制台开通后再试' : e.message);
+        throw new Error('口语评测失败：' + e.message);
       }
       const listenId = 'tencent-soe';
       const coachM = currentModel();

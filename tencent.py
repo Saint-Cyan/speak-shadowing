@@ -7,6 +7,7 @@ SPEAK_TENCENT_SECRET_ID / SPEAK_TENCENT_SECRET_KEY。浏览器拿不到。
 import hashlib
 import hmac
 import json
+import re
 import time
 from datetime import datetime, timezone
 
@@ -92,9 +93,71 @@ async def asr_status(task_id: str) -> dict:
     return r["Data"]
 
 
-# ---------------- 智聆口语评测（旧版 HTTP 接口，一次性评测） ----------------
-async def soe_eval(ref_text: str, wav_b64: str, session_id: str, eval_mode: int = 1, coeff: float = 3.5) -> dict:
-    p = {"SeqId": 1, "IsEnd": 1, "VoiceFileType": 2, "VoiceEncodeType": 1, "UserVoiceData": wav_b64,
-         "SessionId": session_id, "RefText": ref_text, "WorkMode": 1, "EvalMode": eval_mode,
-         "ScoreCoeff": coeff, "ServerType": 0}
-    return await call("soe", "TransmitOralProcessWithInit", "2018-07-24", p, timeout=60, region="")
+# ---------------- 智聆口语评测（新版，WebSocket 录音识别模式：一次性发送 ≤60 秒音频） ----------------
+_appid = {"v": CONFIG.get("tencent_appid", "")}
+
+
+async def appid() -> str:
+    """新版口语评测的地址里要带账号 AppID：优先读配置 tencent_appid，没有就向腾讯云查询一次。"""
+    if not _appid["v"]:
+        r = await call("cam", "GetUserAppId", "2019-01-16", {}, region="ap-guangzhou")
+        _appid["v"] = str(r["AppId"])
+    return _appid["v"]
+
+
+SOE_ERRORS = {
+    4001: "参数不合法", 4002: "鉴权失败（密钥不对）", 4003: "账号还没开通“智聆口语评测（新版）”",
+    4004: "口语评测资源包已用完，请开通后付费或购买资源包", 4005: "腾讯云账户欠费，口语评测已停用",
+    4006: "口语评测并发超限，请稍后再试", 4007: "录音解码失败", 4014: "录音太长", 4106: "录音太长",
+    4102: "参考句子为空", 4103: "句子里有评测引擎不认识的词", 4104: "句子太长",
+    4105: "录音里没有检测到人声", 4108: "录音里没有识别到有效发音", 4114: "句子内容无效", 4115: "句子语言和评测引擎不匹配",
+}
+
+
+async def soe_eval(ref_text: str, wav: bytes, eval_mode: int = 1, coeff: float = 3.5) -> dict:
+    """返回与旧版接口相同结构的结果（SuggestedScore / PronAccuracy / PronFluency / PronCompletion / Words[].PhoneInfos）。"""
+    if not enabled():
+        raise TencentError("NotConfigured", "服务器没有配置腾讯云密钥")
+    import base64 as _b64
+    import random
+    import urllib.parse
+    aid = await appid()
+    now = int(time.time())
+    p = {"secretid": SECRET_ID, "timestamp": now, "expired": now + 3600, "nonce": random.randint(1, 9_999_999_999),
+         "server_engine_type": "16k_en", "voice_id": uuid_str(), "voice_format": 1, "text_mode": 0,
+         "ref_text": ref_text, "eval_mode": eval_mode, "score_coeff": coeff, "sentence_info_enabled": 0, "rec_mode": 1}
+    keys = sorted(p)
+    raw = f"soe.cloud.tencent.com/soe/api/{aid}?" + "&".join(f"{k}={p[k]}" for k in keys)
+    sig = _b64.b64encode(hmac.new(SECRET_KEY.encode(), raw.encode("utf-8"), hashlib.sha1).digest()).decode()
+    url = f"wss://soe.cloud.tencent.com/soe/api/{aid}?" + urllib.parse.urlencode([(k, p[k]) for k in keys] + [("signature", sig)])
+    result = None
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), trust_env=True) as s:
+        async with s.ws_connect(url, heartbeat=None) as ws:
+            first = json.loads((await ws.receive(timeout=15)).data)
+            if first.get("code"):
+                raise TencentError(str(first["code"]), SOE_ERRORS.get(first["code"], first.get("message", "")), first.get("voice_id", ""))
+            await ws.send_bytes(wav)
+            await ws.send_str('{"type": "end"}')
+            while True:
+                m = await ws.receive(timeout=45)
+                if m.type != aiohttp.WSMsgType.TEXT:
+                    break
+                j = json.loads(m.data)
+                if j.get("code"):
+                    raise TencentError(str(j["code"]), SOE_ERRORS.get(j["code"], j.get("message", "")), j.get("voice_id", ""))
+                if j.get("result"):
+                    r = j["result"]
+                    result = json.loads(r) if isinstance(r, str) else r
+                if j.get("final") == 1:
+                    break
+    if not result:
+        raise TencentError("NoResult", "口语评测没有返回结果")
+    for w in result.get("Words") or []:  # 新版 ReferenceWord 带序号后缀，如 thanks_0
+        if isinstance(w.get("ReferenceWord"), str):
+            w["ReferenceWord"] = re.sub(r"_\d+$", "", w["ReferenceWord"])
+    return result
+
+
+def uuid_str() -> str:
+    import uuid
+    return str(uuid.uuid4())

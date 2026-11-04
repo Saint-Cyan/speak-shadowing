@@ -70,8 +70,9 @@ ffmpeg：优先用系统里的 `ffmpeg`，没有时使用 `imageio-ffmpeg` 自�
 | `oauth_relay_url` | `SPEAK_OAUTH_RELAY_URL` | 微信等第三方登录的中转地址 |
 | `share_code` | `SPEAK_SHARE_CODE` | 托管网关的访问码，用于“添加到主屏幕”的启动地址（可选） |
 | `tts_engine` | `SPEAK_TTS_ENGINE` | 默认发音来源：`edge`（默认）或 `tencent`；用户在播放设置里改过之后以用户选择为准 |
-| `tencent_secret_id` / `tencent_secret_key` | `SPEAK_TENCENT_SECRET_ID` / `SPEAK_TENCENT_SECRET_KEY` | 腾讯云密钥。用于：朗读（发音来源选腾讯云时，需领取或购买对应音色的资源包）；音视频导入（录音文件识别，自动区分说话人）；发音分析（智聆口语评测，逐音素打分）。只在服务器上使用，建议用只授权这两项服务的子账号 |
+| `tencent_secret_id` / `tencent_secret_key` | `SPEAK_TENCENT_SECRET_ID` / `SPEAK_TENCENT_SECRET_KEY` | 腾讯云密钥。用于：朗读（发音来源选腾讯云时，需领取或购买对应音色的资源包）；音视频导入（录音文件识别，自动区分说话人）；发音分析（智聆口语评测新版，逐音素打分）。只在服务器上使用，建议用只授权这两项服务的子账号 |
 | `tencent_region` | `SPEAK_TENCENT_REGION` | 腾讯云地域，默认 `ap-shanghai` |
+| `tencent_appid` | `SPEAK_TENCENT_APPID` | 腾讯云账号 AppID（新版口语评测地址需要），不填时自动查询（需要 `cam:GetUserAppId` 权限） |
 | — | `PORT` | 监听端口，默认 3000 |
 | — | `MEDIA_DIR` | 导入时的临时目录，默认 `/tmp/speak-media` |
 | — | `TTS_CACHE_DIR` | 语音合成磁盘缓存目录，默认 `/tmp/speak-tts` |

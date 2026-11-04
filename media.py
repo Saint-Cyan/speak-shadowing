@@ -603,14 +603,21 @@ async def pron_assess(req: PronReq, request: Request):
         raise HTTPException(400, "句子里没有英文单词")
     if n > 120:
         raise HTTPException(400, "句子太长（口语评测最多 120 个单词）")
-    if len(req.wav_b64) > 4_000_000:
-        raise HTTPException(413, "录音太长（口语评测最多约 90 秒）")
+    try:
+        wav = base64.b64decode(req.wav_b64)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "录音数据格式不对")
+    if len(wav) > 44 + 16000 * 2 * 60:
+        raise HTTPException(413, "录音太长（口语评测最多 60 秒）")
     t0 = time.time()
     try:
-        r = await tencent.soe_eval(ref, req.wav_b64, uuid.uuid4().hex, eval_mode=1 if n <= 30 else 2)
+        r = await tencent.soe_eval(ref, wav, eval_mode=1 if n <= 30 else 2)
     except tencent.TencentError as e:
         event("soe_error", f"口语评测失败：{e.code} {e.message[:200]}", "error")
-        raise HTTPException(502, f"{e.code}: {e.message}")
+        raise HTTPException(502, e.message if e.code.isdigit() else f"{e.code}: {e.message}")
+    except Exception as e:  # noqa: BLE001
+        event("soe_error", f"口语评测失败：{type(e).__name__} {str(e)[:200]}", "error")
+        raise HTTPException(502, f"口语评测连接失败：{type(e).__name__}")
     tags = {0: "ok", 1: "inserted", 2: "missing", 3: "mispronounced", 4: "unknown"}
     words = []
     for w in r.get("Words") or []:
