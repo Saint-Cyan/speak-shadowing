@@ -67,6 +67,7 @@
     <section class="card"><h2>磁盘与导入临时文件</h2><div id="disk"></div></section>
     <section class="card wide"><h2>导入任务（服务器端，只保存在内存里）</h2><div id="jobs"></div></section>
     <section class="card"><h2>登录核实与依赖</h2><div id="auth"></div></section>
+    <section class="card"><h2>语音合成（腾讯云，本进程启动以来）</h2><div id="tts"></div></section>
     <section class="card"><h2>本页观察到的实例变化</h2><div class="muted">打开本页期间，每次刷新如果进程编号或主机名变了就记一条：同一主机换了进程 = 重启；主机名来回变 = 多实例。</div><div id="seen" class="log"></div><button id="clearSeen" style="margin-top:6px">清空记录</button></section>
     <section class="card wide"><h2>接口请求统计（本进程启动以来）</h2><div id="req"></div></section>
     <section class="card wide"><h2>事件日志</h2><div id="events" class="log"></div></section>
@@ -154,7 +155,7 @@ function render(s) {
       <div class="m"><span>任务总数</span><b>${J.total}</b></div><div class="m"><span>进行中</span><b>${J.active}</b></div>
       <div class="m"><span>就绪</span><b class="ok">${J.by_state.ready}</b></div><div class="m"><span>失败</span><b class="${J.by_state.error ? 'bad' : ''}">${J.by_state.error}</b></div></div>
     ${J.items.length ? `<table><tr><th>任务</th><th>来源</th><th>状态</th><th>说明</th><th class="n">已存在</th><th class="n">分段</th><th class="n">时长</th></tr>
-      ${J.items.map((x) => `<tr><td>${esc(x.id)}</td><td>${x.source === 'bili' ? 'B 站' : '本地文件'}${x.engine ? ` · ${x.engine === 'tencent' ? '腾讯云' : 'Gemini'}` : ''}</td>
+      ${J.items.map((x) => `<tr><td>${esc(x.id)}</td><td>${x.source === 'bili' ? 'B 站' : '本地文件'}</td>
         <td><span class="pill ${x.state === 'error' ? 'bad' : x.state === 'ready' ? 'ok' : 'warn'}">${STATE[x.state] || x.state}</span></td>
         <td>${esc(x.message)}</td><td class="n">${dur(x.age_s)}</td><td class="n">${x.chunks || ''}</td><td class="n">${x.duration_ms ? dur(x.duration_ms / 1000) : ''}</td></tr>`).join('')}</table>`
       : '<div class="muted">本进程里没有导入任务。</div>'}`;
@@ -164,9 +165,17 @@ function render(s) {
     ['最近成功', a.last_ok_at ? tm(a.last_ok_at) : '—'],
     ['最近失败', a.last_error_at ? `${tm(a.last_error_at)}<div class="muted">${esc(a.last_error)}</div>` : '—'],
     ['ffmpeg', esc(s.ffmpeg)],
-    ['腾讯云语音', J.tencent ? '<span class="pill ok">已配置（识别 + 口语评测）</span>' : '<span class="pill">未配置，导入用 Gemini 逐段听写</span>'],
+    ['腾讯云语音', J.tencent ? '<span class="pill ok">已配置（识别 + 口语评测）</span>' : '<span class="pill bad">未配置：导入和发音分析不可用</span>'],
     ['登录令牌形态', (J.token_shapes || []).length ? `<div class="muted">最近 ${J.token_shapes.length} 种不同令牌（只记形态不记内容）：</div>${J.token_shapes.slice(-6).reverse().map((x) => `<div class="muted">${tm(x.t)} · 长度 ${x.len} · ${x.parts} 段 · 摘要 ${esc(x.digest)}${x.iat ? ` · 签发 ${tm(x.iat)}` : ''}${x.exp ? ` · 过期 ${tm(x.exp)}` : ''}${x.jwt === false ? ' · 不是 JWT' : ''}</div>`).join('')}` : '—'],
   ]);
+  const T = s.tts || {};
+  $('tts').innerHTML = T.error ? `<div class="bad">${esc(T.error)}</div>` : kv([
+    ['合成次数', T.synth_calls ?? 0],
+    ['消耗字符', Object.entries(T.chars || {}).map(([k, v]) => `${esc(k)} ${v}`).join('；') || '0'],
+    ['命中缓存', `内存 ${T.cache_mem ?? 0} 次 · 磁盘 ${T.cache_disk ?? 0} 次（磁盘缓存 ${T.cache_files ?? 0} 条）`],
+    ['逐词时间', `识别对齐 ${T.align_asr ?? 0} 次 · 估算 ${T.align_estimate ?? 0} 次`],
+    ['失败', T.errors ? `<span class="bad">${T.errors} 次</span>：${esc(T.last_error || '')}（${tm(T.last_error_at)}）` : '0'],
+  ]) + '<div class="muted" style="margin-top:6px">免费额度剩余请到腾讯云语音合成控制台查看：超自然音色 2 万字符、大模型音色 10 万字符、精品音色 800 万字符。</div>';
   const rq = Object.entries(s.requests);
   $('req').innerHTML = rq.length ? `<table><tr><th>接口</th><th class="n">次数</th><th class="n">4xx</th><th class="n">5xx</th><th class="n">平均耗时</th></tr>
     ${rq.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${v.n}</td><td class="n ${v.err4 ? 'warn' : ''}">${v.err4}</td><td class="n ${v.err5 ? 'bad' : ''}">${v.err5}</td><td class="n">${v.avg_ms} ms</td></tr>`).join('')}</table>

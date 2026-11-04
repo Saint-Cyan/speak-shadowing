@@ -236,6 +236,17 @@ def _load_previous():
         pass
 
 
+def _tts_stats():
+    try:
+        import tts
+        st = dict(tts.STATS)
+        st["cache_dir"] = str(tts.CACHE_DIR)
+        st["cache_files"] = len(list(tts.CACHE_DIR.glob("*.json"))) if tts.CACHE_DIR.exists() else 0
+        return st
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def tencent_ok():
     try:
         import tencent
@@ -347,6 +358,7 @@ async def status(request: Request):
         "disk": {"tmp": disk(Path("/tmp")), "ops": disk(OPS_DIR)},
         "ffmpeg": ff,
         "jobs": _jobs_summary(),
+        "tts": _tts_stats(),
         "requests": {k: {"n": v["n"], "err4": v["err4"], "err5": v["err5"], "avg_ms": round(v["ms"] / v["n"]) if v["n"] else 0}
                      for k, v in sorted(_req.items(), key=lambda kv: -kv[1]["n"])},
         "recent_errors": list(_errors)[-20:],

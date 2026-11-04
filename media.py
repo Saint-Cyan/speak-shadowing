@@ -1,7 +1,6 @@
 """视频 / 音频导入：解析 B 站链接、下载音频或接收本地文件，用 ffmpeg 转成单声道并按静音切成 ≤55 秒的小段。
 
-切段的原因：云服务里能听音频的模型（Gemini）单次只能处理约 60 秒。转写与整理在浏览器里调用模型完成，
-这里只负责准备音频。所有接口都要求带登录令牌，后端会向云服务核实身份，避免被陌生人当下载器用。
+整段音频交给腾讯云录音文件识别（说话人分离 + 词级时间戳）；切段只用于保存每句的原声。翻译整理在浏览器里调用模型完成。所有接口都要求带登录令牌，后端会向云服务核实身份，避免被陌生人当下载器用。
 
 接口：
   POST /api/media/bili/info        {"url": "..."}  → 视频标题与分 P 列表
@@ -43,10 +42,8 @@ PUBLISHABLE_KEY = CONFIG["cloud_publishable_key"]  # 公开配置，不是密钥
 WORK = Path(os.environ.get("MEDIA_DIR", "/tmp/speak-media"))
 MAX_SECONDS = 2 * 3600        # 单次导入上限 2 小时
 MAX_UPLOAD = 300 * 1024 * 1024
-CHUNK_MAX = 55.0              # Gemini 听写时每段最长秒数（模型约 60 秒上限，留余量）
-CHUNK_MIN = 30.0              # 在 30–55 秒之间找停顿切开
-ASR_CHUNK_MAX = 180.0         # 腾讯云整段识别时，分段只用于保存原声，可以更长
-ASR_CHUNK_MIN = 90.0
+CHUNK_MAX = 180.0             # 分段只用于保存原声（整段交给腾讯云识别），在 90–180 秒之间找停顿切开
+CHUNK_MIN = 90.0
 ASR_INLINE_MAX = 4_800_000    # 不超过约 4.8MB 的音频直接随请求提交，更大的让腾讯云按链接下载
 JOB_TTL = 12 * 3600
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
@@ -401,16 +398,15 @@ async def _prepare(jid: str, src: Path, start_s: float, end_s: Optional[float]):
         starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", log)]
         ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", log)]
         silences = list(zip(starts, ends))
-        engine = "gemini"
-        if tencent.enabled():
-            try:
-                j["sentences"] = await _tencent_asr(jid, full, duration)
-                engine = "tencent"
-            except Exception as e:  # noqa: BLE001
-                j["asr_error"] = str(e)[-300:]
-                event("asr_failed", f"任务 {jid[:6]} 腾讯云识别失败，改用 Gemini 逐段听写：{str(e)[-200:]}", "error")
-        j["engine"] = engine
-        plan = _plan_chunks(duration, silences, ASR_CHUNK_MAX, ASR_CHUNK_MIN) if engine == "tencent" else _plan_chunks(duration, silences)
+        if not tencent.enabled():
+            raise RuntimeError("服务器没有配置腾讯云密钥，无法识别")
+        try:
+            j["sentences"] = await _tencent_asr(jid, full, duration)
+        except Exception as e:  # noqa: BLE001
+            event("asr_failed", f"任务 {jid[:6]} 腾讯云识别失败：{str(e)[-200:]}", "error")
+            raise RuntimeError(f"腾讯云语音识别失败：{str(e)[-200:]}")
+        engine = j["engine"] = "tencent"
+        plan = _plan_chunks(duration, silences)
         j.update(message=f"正在切分为 {len(plan)} 段…")
         chunks = []
         for i, (a, b) in enumerate(plan):
@@ -421,7 +417,7 @@ async def _prepare(jid: str, src: Path, start_s: float, end_s: Optional[float]):
         event("job_ready", f"任务 {jid[:6]} 音频就绪：{round(duration)} 秒，{len(chunks)} 段（{engine}），用时 {round(time.time() - j['created'])} 秒")
     except Exception as e:  # noqa: BLE001
         event("job_error", f"任务 {jid[:6]} 音频处理失败：{str(e)[-300:]}", "error")
-        j.update(state="error", message=f"音频处理失败：{str(e)[-200:]}")
+        j.update(state="error", message=str(e)[-200:] if "腾讯云" in str(e) else f"音频处理失败：{str(e)[-200:]}")
 
 
 async def _bili_download(jid: str, bvid: str, cid: int, start_s: float, end_s: Optional[float]):
