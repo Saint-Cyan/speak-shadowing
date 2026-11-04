@@ -2764,17 +2764,17 @@ async function nameSpeakers(src, utts, signal) {
     ids.forEach((sp) => utts.filter((u) => u.sp === sp).slice(0, 8).forEach((u) => sample.push(u)));
     const ordered = utts.slice(0, 60);
     try {
-      mediaProgress(src.id, '识别说话人名字…');
-      const r = await aiCall('media_speakers', `Speech recognition split this recording from ${fence(src.title)} into anonymous speakers.
+      const r = await aiWait(src.id, '识别说话人名字', 'media_speakers', `Speech recognition split this recording from ${fence(src.title)} into anonymous speakers.
 Opening lines in order (JSON): ${fence(JSON.stringify(ordered.map((u) => ({ s: u.sp, t: u.t }))))}
 More lines per speaker (JSON): ${fence(JSON.stringify(sample.map((u) => ({ s: u.sp, t: u.t }))))}
 For each speaker label, give the person's name if it can be inferred from the content (names said by others, self-introductions), "Narrator" for a narrator/host voice-over, otherwise keep the label. Keep it short (max 20 chars).
-JSON shape: {"names":{"Speaker 1":"..."}}`, { signal });
+JSON shape: {"names":{"Speaker 1":"..."}}`, signal, 60000);
       const j = parseJSON(r.text);
       map = {};
       ids.forEach((sp) => { const v = j.names && j.names[sp]; map[sp] = v ? String(v).trim().slice(0, 30) || sp : sp; });
     } catch (e) {
       if (e instanceof Stopped) throw e;
+      toast(`没能推断出说话人名字（${e.message}），先用“Speaker 1/2…”`, 4000);
       map = Object.fromEntries(ids.map((x) => [x, x]));
     }
     opts.speaker_names = map;
@@ -2782,14 +2782,52 @@ JSON shape: {"names":{"Speaker 1":"..."}}`, { signal });
   }
   utts.forEach((u) => { if (map[u.sp]) u.sp = map[u.sp]; });
 }
-function promptOrganize(title, items) {
+function promptOrganize(title, items, withMeta) {
   return `These are consecutive lines transcribed from ${fence(title)} (English listening material that a Chinese software engineer will use for speaking practice).
 Lines (JSON; "i" is the index, "s" the speaker): ${fence(JSON.stringify(items))}
 Give:
-- "title": a short Chinese title (max 20 chars) describing what happens in this part;
-- "translations": a natural Chinese translation for EVERY line, same "i";
-- "key_expressions": 3-6 reusable English chunks from these lines.
-JSON shape: {"title":"...","translations":[{"i":0,"zh":"..."}],"key_expressions":[{"expr":"...","meaning":"中文意思","usage":"中文：什么场合用"}]}`;
+${withMeta ? `- "title": a short Chinese title (max 20 chars) describing what happens in this part;
+` : ''}- "translations": a natural Chinese translation for EVERY line, same "i";
+${withMeta ? `- "key_expressions": 3-6 reusable English chunks from these lines.
+` : ''}JSON shape: {${withMeta ? '"title":"...",' : ''}"translations":[{"i":0,"zh":"..."}]${withMeta ? ',"key_expressions":[{"expr":"...","meaning":"中文意思","usage":"中文：什么场合用"}]' : ''}}`;
+}
+const TR_BATCH = 40, TR_PARALLEL = 3;
+// 把一段对话按 40 句一批翻译，最多 3 批同时进行；某一批失败重试一次，仍失败就这几句先不带翻译
+async function translateSegment(src, part, signal, label) {
+  const batches = [];
+  for (let i = 0; i < part.length; i += TR_BATCH) batches.push(i);
+  const tr = new Array(part.length).fill(null);
+  let meta = null, done = 0, failed = 0, next = 0, lastErr = null;
+  const t0 = Date.now();
+  const show = () => mediaProgress(src.id, `${label}：翻译 ${done}/${batches.length} 批（${modelLabel(currentModel())}，已用 ${Math.round((Date.now() - t0) / 1000)} 秒）`,
+    Math.round(done * 100 / batches.length));
+  const tick = setInterval(show, 1000);
+  show();
+  const worker = async () => {
+    while (next < batches.length) {
+      const b = next++, start = batches[b], items = part.slice(start, start + TR_BATCH).map((u, i) => ({ i, s: u.sp, text: u.t }));
+      let ok = false;
+      for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+        chk(signal);
+        try {
+          const r = await aiCall('media_organize', promptOrganize(src.title, items, b === 0), { signal });
+          const j = parseJSON(r.text);
+          (Array.isArray(j.translations) ? j.translations : []).forEach((x) => {
+            const k = Number(x && x.i);
+            if (Number.isInteger(k) && k >= 0 && k < items.length && x.zh) tr[start + k] = String(x.zh).slice(0, 1000);
+          });
+          if (b === 0) meta = j;
+          ok = true;
+        } catch (e) { if (e instanceof Stopped || signal.aborted) throw new Stopped(); lastErr = e; }
+      }
+      if (!ok) failed++;
+      done++;
+    }
+  };
+  try { await Promise.all(Array.from({ length: Math.min(TR_PARALLEL, batches.length) }, worker)); }
+  finally { clearInterval(tick); show(); }
+  if (failed) toast(`${label}有 ${failed} 批翻译失败，这些句子先不带翻译：${lastErr ? lastErr.message : ''}`, 4500);
+  return { tr, meta };
 }
 function splitSegments(utts, segMs) {
   if (!utts.length) return [];
@@ -2834,23 +2872,17 @@ async function organizeSource(src, chunks, signal) {
     const [a, b] = segs[k];
     const part = utts.slice(a, b);
     const range = `${mmss(offset + part[0].abs)}–${mmss(offset + part[part.length - 1].absEnd)}`;
-    mediaProgress(id, `整理成对话… ${k}/${segs.length}`, Math.round(k * 100 / segs.length));
+    const label = segs.length > 1 ? `第 ${k + 1}/${segs.length} 段对话` : '整理对话';
+    mediaProgress(id, `${label}…`, Math.round(k * 100 / segs.length));
     let title = segs.length > 1 ? `${src.title.slice(0, 60)} · ${range}` : src.title.slice(0, 100);
     let tr = [], notes = null;
     if (opts.translate) {
-      let ok = false, lastErr = null;
-      for (let attempt = 0; attempt < 2 && !ok; attempt++) {
-        try {
-          const r = await aiCall('media_organize', promptOrganize(src.title, part.map((u, i) => ({ i, s: u.sp, text: u.t }))), { signal });
-          const j = parseJSON(r.text);
-          if (j.title) title = `${String(j.title).slice(0, 40)}${segs.length > 1 ? ` · ${range}` : ''}`;
-          tr = Array.isArray(j.translations) ? j.translations : [];
-          const keys = (Array.isArray(j.key_expressions) ? j.key_expressions : []).filter((x) => x && x.expr);
-          notes = keys.map((x) => `• ${x.expr} — ${x.meaning || ''}${x.usage ? '\n  ' + x.usage : ''}`).join('\n').slice(0, 4000) || null;
-          ok = true;
-        } catch (e) { if (e instanceof Stopped) throw e; lastErr = e; }
-      }
-      if (!ok) toast(`第 ${k + 1} 段翻译失败，先不带翻译保存：${lastErr ? lastErr.message : ''}`, 4000);
+      const r = await translateSegment(src, part, signal, label);
+      tr = r.tr;
+      const j = r.meta || {};
+      if (j.title) title = `${String(j.title).slice(0, 40)}${segs.length > 1 ? ` · ${range}` : ''}`;
+      const keys = (Array.isArray(j.key_expressions) ? j.key_expressions : []).filter((x) => x && x.expr);
+      notes = keys.map((x) => `• ${x.expr} — ${x.meaning || ''}${x.usage ? '\n  ' + x.usage : ''}`).join('\n').slice(0, 4000) || null;
     }
     const counts = {};
     part.forEach((u) => { counts[u.sp] = (counts[u.sp] || 0) + 1; });
@@ -2861,7 +2893,7 @@ async function organizeSource(src, chunks, signal) {
       scene: `来源：${src.kind === 'bili' ? 'B 站' : '本地文件'}「${src.title}」${range}`.slice(0, 1000),
       role_a: (rank[0] || 'A').slice(0, 40), role_b: (rank[1] || 'B').slice(0, 40), notes,
     });
-    const zh = (i) => { const x = tr.find((y) => y && Number(y.i) === i); return x && x.zh ? String(x.zh).slice(0, 1000) : null; };
+    const zh = (i) => tr[i] || null;
     const rows = part.map((u, i) => ({ dialogue_id: d.id, speaker: ab(u.sp), speaker_name: u.sp, text: u.t, translation: zh(i), src: u.src, position: i }));
     for (let i = 0; i < rows.length; i += 200) await api.insert('lines', rows.slice(i, i + 200));
     opts.segments_done = k + 1;
@@ -2871,6 +2903,24 @@ async function organizeSource(src, chunks, signal) {
   mediaProgress(id, '', 100);
   toast(`「${src.title.slice(0, 30)}」导入完成，生成 ${segs.length} 段对话`, 4000);
   if (nav.tab === 'topics' && nav.topicId === src.topic_id && !nav.dialogueId) renderNav();
+}
+
+// 一边等模型，一边每秒刷新“已等待 N 秒”；超时（ms）或用户停止时中止这次调用
+async function aiWait(id, label, kind, prompt, signal, ms) {
+  const ac = new AbortController();
+  const onStop = () => ac.abort();
+  signal.addEventListener('abort', onStop, { once: true });
+  const t0 = Date.now();
+  let timedOut = false;
+  const tick = setInterval(() => mediaProgress(id, `${label}（${modelLabel(currentModel())}，已等待 ${Math.round((Date.now() - t0) / 1000)} 秒）`), 1000);
+  const timer = ms ? setTimeout(() => { timedOut = true; ac.abort(); }, ms) : 0;
+  mediaProgress(id, `${label}（${modelLabel(currentModel())}）`);
+  try { return await aiCall(kind, prompt, { signal: ac.signal }); }
+  catch (e) {
+    if (signal.aborted) throw new Stopped();
+    if (timedOut) throw new Error(`超过 ${Math.round(ms / 1000)} 秒没有完成`);
+    throw e;
+  } finally { clearInterval(tick); clearTimeout(timer); signal.removeEventListener('abort', onStop); }
 }
 
 /* ---------- 话题页上的导入进度卡片 ---------- */

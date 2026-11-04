@@ -1,5 +1,5 @@
 // 只缓存页面外壳，保证弱网下能打开；语音接口与云服务请求一律走网络。
-const CACHE = 'speak-shell-v13';
+const CACHE = 'speak-shell-v14';
 const SHELL = ['/', '/manifest.webmanifest', '/static/icon-192.png', '/static/icon-512.png'];
 
 self.addEventListener('install', (e) => {
