@@ -2309,7 +2309,7 @@ function refreshRecs(s) {
       <span class="muted rt">${fmtTime(r.created_at)}</span>
       <span class="muted">${r.duration_ms ? (r.duration_ms / 1000).toFixed(1) + 's' : ''}${r.source === 'shadow' ? ' · 跟读' : ''}${r.line_text && r.line_text !== s.text ? ' · 句子已改' : ''}</span>
       <span style="flex:1"></span>
-      ${r.analysis ? `<button data-r="ana" class="score ${lvl(r.analysis.overall)}" title="查看发音分析">${r.analysis.overall != null ? r.analysis.overall + ' 分' : '已分析'}</button>` : '<button data-r="ana" title="让 AI 分析这次录音的发音">🔍 分析</button>'}
+      ${pronRunning(r.id) ? '<button data-r="ana" title="正在分析，点击查看进度">⏳ 分析中</button>' : r.analysis ? `<button data-r="ana" class="score ${lvl(r.analysis.overall)}" title="查看发音分析">${r.analysis.overall != null ? r.analysis.overall + ' 分' : '已分析'}</button>` : '<button data-r="ana" title="让 AI 分析这次录音的发音">🔍 分析</button>'}
       <button data-r="play" title="播放这次录音">▶</button><button data-r="cmp" title="先放原音再放这次录音">⇄</button><button data-r="del" title="删除">✕</button>
     </div>`).join('')}
     ${rows.length > shown.length ? `<button class="ghost" data-r="all" style="padding:4px 0;font-size:13px">显示全部 ${rows.length} 条</button>` : ''}</details>`;
@@ -2430,33 +2430,21 @@ function analysisHtml(a, s) {
     ${a.notes ? `<div class="muted" style="margin-top:6px">评测备注：${esc(a.notes)}</div>` : ''}
     <div class="muted" style="font-size:12px;margin-top:8px">${a.listen_model === 'tencent-soe' ? `腾讯云智聆口语评测逐个音素打分，${esc(engineLabel(a.coach_model))} 写讲解。` : `粗略分析：${esc(engineLabel(a.listen_model))} 听录音判断，${esc(engineLabel(a.coach_model))} 写讲解。细微的元音、重音问题可能漏掉，仅供参考。`}</div>`;
 }
-async function openPronAnalysis(s, row) {
-  if (!(await aiReady())) return;
-  const soeOn = appCfg.speechEngine === 'tencent';
-  const ctl = openModal(`<h3>🔍 发音分析</h3><div class="muted">${fmtTime(row.created_at)} 的录音${row.line_text && row.line_text !== s.text ? '（录音时句子和现在不同，按录音时的句子分析）' : ''}</div>
-    <div class="row" style="margin-top:8px"><button type="button" data-mine>▶ 我的录音</button><button type="button" data-cmp>⇄ 先原音再我的</button></div>
-    <div data-res class="outbox"></div>
-    <form class="f" novalidate>
-      <div class="muted">${soeOn ? '打分：腾讯云智聆口语评测（逐个音素）' : '<span class="err">服务器没有配置腾讯云密钥，暂时无法分析发音</span>'}</div>
-      ${modelHint().replace('使用的模型', '写讲解的模型')}
-      <div class="row end"><button type="button" class="ghost" data-x>关闭</button><button type="submit" class="primary"${soeOn ? '' : ' disabled'}>${row.analysis ? '重新分析' : '开始分析'}</button></div>
-    </form>
-    <div data-out></div>`);
-  const res = ctl.m.querySelector('[data-res]'), out = ctl.m.querySelector('[data-out]'), f = ctl.m.querySelector('form');
+// 发音分析在后台运行：关掉弹窗不会中断，可以继续录下一句；完成后提示，录音行上显示分数
+const pronJobs = new Map(); // 录音 id → { step, ac, err, done, t0, lineId, listeners:Set }
+function pronNotify(id) { const j = pronJobs.get(id); if (j) j.listeners.forEach((f) => f(j)); }
+function pronRefreshRow(lineId) { const cur = sentences.find((x) => x.id === lineId); if (cur) refreshRecs(cur); }
+function startPronJob(s, row) {
+  if (pronJobs.has(row.id) && !pronJobs.get(row.id).done) return pronJobs.get(row.id);
+  const prev = pronJobs.get(row.id);
+  const job = { step: '准备录音…', ac: new AbortController(), err: null, done: false, t0: Date.now(), lineId: row.line_id, listeners: prev ? prev.listeners : new Set() };
+  pronJobs.set(row.id, job);
   const ref = row.line_text || s.text;
-  const show = () => { if (row.analysis) res.innerHTML = analysisHtml(row.analysis, { text: ref }); };
-  show();
-  ctl.m.querySelector('[data-mine]').onclick = async () => { try { const u = await recUrl(row); run(() => playUrl(u, 1, null)); } catch (e) { toast(e.message); } };
-  ctl.m.querySelector('[data-cmp]').onclick = async () => { try { compare(s, await recUrl(row)); } catch (e) { toast(e.message); } };
-  res.onclick = (e) => { const b = e.target.closest('[data-say]'); if (b) playWord(b.dataset.say, s.speaker, +b.dataset.rate || 1); };
-  f.onsubmit = async (e) => {
-    e.preventDefault();
-    if (ctl.aborter) return;
-    const ac = new AbortController(); ctl.aborter = ac;
-    const btn = f.querySelector('[type=submit]'); btn.disabled = true;
-    const step = (t) => { out.innerHTML = `<div class="aiprog"><span>${esc(t)}</span><button type="button" class="ghost">停止</button></div>`; out.querySelector('button').onclick = () => ac.abort(); };
+  const step = (t) => { job.step = t; pronNotify(row.id); };
+  pronRefreshRow(row.line_id);
+  (async () => {
+    const ac = job.ac;
     try {
-      step('准备录音…');
       let blob = null;
       if (recUrls.has(row.id)) blob = await (await fetch(recUrls.get(row.id))).blob();
       else { const r = await cloud.storage.download(row.path); blob = r && !r.error ? r.data : null; }
@@ -2474,23 +2462,83 @@ async function openPronAnalysis(s, row) {
         logCall({ kind: 'pron_listen', model: 'tencent-soe', ok: false, error_code: String(e.message).slice(0, 100), duration_ms: Date.now() - t0 });
         throw new Error('口语评测失败：' + e.message);
       }
-      const listenId = 'tencent-soe';
       const coachM = currentModel();
       const t1 = Date.now();
       step(`② ${modelLabel(coachM)} 正在写讲解…`);
       const C = await aiCall('pron_coach', promptPronCoach(ref, listen), {
         signal: ac.signal,
-        onProgress: () => { const sp = out.querySelector('span'); if (sp) sp.textContent = `② ${modelLabel(coachM)} 正在写讲解… ${Math.round((Date.now() - t1) / 1000)}s`; },
+        onProgress: () => { const t = `② ${modelLabel(coachM)} 正在写讲解… ${Math.round((Date.now() - t1) / 1000)}s`; if (t !== job.step) step(t); },
       });
-      const analysis = Object.assign(listen, { coach: cleanCoach(parseJSON(C.text)), listen_model: listenId, coach_model: C.model.id, at: new Date().toISOString(), v: 1 });
+      const analysis = Object.assign(listen, { coach: cleanCoach(parseJSON(C.text)), listen_model: 'tencent-soe', coach_model: C.model.id, at: new Date().toISOString(), v: 1 });
       await api.update('recordings', row.id, { analysis });
       row.analysis = analysis;
-      out.innerHTML = ''; show(); btn.textContent = '重新分析';
-      refreshRecs(s);
-      res.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } catch (ex) {
-      if (!ctl.closed) out.innerHTML = `<div class="err" style="margin-top:10px">${esc(ex instanceof Stopped || ac.signal.aborted ? '已停止' : ex.message)}</div>`;
-    } finally { ctl.aborter = null; btn.disabled = false; }
+      (recIndex.get(row.line_id) || []).forEach((x) => { if (x.id === row.id) x.analysis = analysis; }); // 页面重载过的话，索引里是另一份对象
+      job.done = true; job.step = '';
+      const viewing = [...job.listeners].some((f) => f.alive());
+      if (!viewing) {
+        toast(`「${ref.slice(0, 24)}${ref.length > 24 ? '…' : ''}」发音分析完成：${analysis.overall != null ? analysis.overall + ' 分' : '已完成'}`,
+          { action: '查看', ms: 8000, onAction: () => { const cur = sentences.find((x) => x.id === row.line_id) || s; openPronAnalysis(cur, row); } });
+      }
+    } catch (e) {
+      job.done = true;
+      job.err = e instanceof Stopped || job.ac.signal.aborted ? '已停止' : e.message;
+      if (![...job.listeners].some((f) => f.alive()) && job.err !== '已停止') toast('发音分析失败：' + job.err, 5000);
+    } finally {
+      pronNotify(row.id);
+      pronRefreshRow(row.line_id);
+      if (job.done && !job.err) setTimeout(() => { if (pronJobs.get(row.id) === job) pronJobs.delete(row.id); }, 0);
+    }
+  })();
+  return job;
+}
+const pronRunning = (rowId) => { const j = pronJobs.get(rowId); return !!(j && !j.done); };
+async function openPronAnalysis(s, row) {
+  if (!(await aiReady())) return;
+  const soeOn = appCfg.speechEngine === 'tencent';
+  const ctl = openModal(`<h3>🔍 发音分析</h3><div class="muted">${fmtTime(row.created_at)} 的录音${row.line_text && row.line_text !== s.text ? '（录音时句子和现在不同，按录音时的句子分析）' : ''}</div>
+    <div class="row" style="margin-top:8px"><button type="button" data-mine>▶ 我的录音</button><button type="button" data-cmp>⇄ 先原音再我的</button></div>
+    <div data-res class="outbox"></div>
+    <form class="f" novalidate>
+      <div class="muted">${soeOn ? '打分：腾讯云智聆口语评测（逐个音素）' : '<span class="err">服务器没有配置腾讯云密钥，暂时无法分析发音</span>'}</div>
+      ${modelHint().replace('使用的模型', '写讲解的模型')}
+      <div class="row end"><button type="button" class="ghost" data-x>关闭</button><button type="submit" class="primary"${soeOn ? '' : ' disabled'}>${row.analysis ? '重新分析' : '开始分析'}</button></div>
+    </form>
+    <div data-out></div>`);
+  const res = ctl.m.querySelector('[data-res]'), out = ctl.m.querySelector('[data-out]'), f = ctl.m.querySelector('form');
+  const btn = f.querySelector('[type=submit]');
+  const ref = row.line_text || s.text;
+  const cur = () => (recIndex.get(row.line_id) || []).find((x) => x.id === row.id) || row;
+  const show = () => { const r = cur(); if (r.analysis) res.innerHTML = analysisHtml(r.analysis, { text: ref }); };
+  const alive = () => !ctl.closed && ctl.m.classList.contains('show') && ctl.m.contains(out);
+  const render = (job) => {
+    if (!alive()) { if (job) job.listeners.delete(listener); return; }
+    if (job && !job.done) {
+      btn.disabled = true;
+      out.innerHTML = `<div class="aiprog"><span>${esc(job.step)}</span><button type="button" class="ghost" data-stop>停止</button></div>
+        <div class="muted" style="margin-top:6px;font-size:13px">分析在后台进行，可以关闭这个窗口继续练习，完成后会提示。</div>`;
+      out.querySelector('[data-stop]').onclick = () => job.ac.abort();
+      return;
+    }
+    btn.disabled = !soeOn;
+    if (job && job.err) out.innerHTML = `<div class="err" style="margin-top:10px">${esc(job.err)}</div>`;
+    else if (job && job.done) { out.innerHTML = ''; show(); btn.textContent = '重新分析'; res.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  };
+  function listener(job) { render(job); }
+  listener.alive = alive;
+  const attach = () => { const j = pronJobs.get(row.id); if (j) { j.listeners.add(listener); render(j); } };
+  const close0 = ctl.close;
+  ctl.close = () => { const j = pronJobs.get(row.id); if (j) j.listeners.delete(listener); close0(); }; // 关闭弹窗不中断后台分析
+  ctl.m.querySelectorAll('[data-x]').forEach((b) => { b.onclick = ctl.close; });
+  show();
+  attach();
+  ctl.m.querySelector('[data-mine]').onclick = async () => { try { const u = await recUrl(row); run(() => playUrl(u, 1, null)); } catch (e) { toast(e.message); } };
+  ctl.m.querySelector('[data-cmp]').onclick = async () => { try { compare(s, await recUrl(row)); } catch (e) { toast(e.message); } };
+  res.onclick = (e) => { const b = e.target.closest('[data-say]'); if (b) playWord(b.dataset.say, s.speaker, +b.dataset.rate || 1); };
+  f.onsubmit = (e) => {
+    e.preventDefault();
+    if (pronRunning(row.id)) return;
+    startPronJob(s, row);
+    attach();
   };
 }
 
