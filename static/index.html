@@ -947,36 +947,69 @@ function pickMime() {
   const c = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'];
   return c.find((t) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || '';
 }
-async function startRecording(s, maxMs, source = 'manual') {
+// 打开麦克风（降噪、回声消除）。跟读时在原音播放期间提前调用，放完就能直接录
+function openMic() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || pickMime() === null)
-    throw new Error('当前浏览器不支持录音，请用 Safari / Chrome 打开');
-  try { recStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); }
-  catch { throw new Error('没有麦克风权限，请在浏览器设置中允许'); }
+    return Promise.reject(new Error('当前浏览器不支持录音，请用 Safari / Chrome 打开'));
+  return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+    .catch(() => { throw new Error('没有麦克风权限，请在浏览器设置中允许'); });
+}
+const releaseMic = (st) => { try { st && st.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ } };
+// 等麦克风真正送出声音数据：刚打开的几百毫秒里采样全是 0
+async function waitMicLive(stream, maxWait = 1500) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { await new Promise((r) => setTimeout(r, 500)); return; }
+  const ctx = new AC();
+  try {
+    if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+    const an = ctx.createAnalyser(); an.fftSize = 512;
+    ctx.createMediaStreamSource(stream).connect(an);
+    const buf = new Float32Array(an.fftSize);
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxWait) {
+      an.getFloatTimeDomainData(buf);
+      if (buf.some((x) => x !== 0)) return;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+  } finally { ctx.close().catch(() => {}); }
+}
+async function startRecording(s, maxMs, source = 'manual', preStream = null) {
+  if (!preStream) setStatus(s, '准备麦克风…');
+  recStream = preStream || await openMic();
   const mime = pickMime();
   recorder = new MediaRecorder(recStream, mime ? { mimeType: mime } : undefined);
   const chunks = [];
   recorder.ondataavailable = (e) => e.data && e.data.size && chunks.push(e.data);
   const recStart = Date.now();
   const recBtn = () => s.el && s.el.querySelector('[data-a="rec"]');
+  const rec = recorder, stream = recStream;
   const stopped = new Promise((res) => {
-    recorder.onstop = () => {
+    rec.onstop = () => {
       clearTimeout(recTimer);
-      recStream.getTracks().forEach((t) => t.stop());
+      releaseMic(stream);
       if (chunks.length) {
-        const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' });
+        const blob = new Blob(chunks, { type: rec.mimeType || 'audio/mp4' });
         s.rec = URL.createObjectURL(blob); // 旧的 URL 可能还挂在历史录音里，不回收
         recCache.set(s.text, s.rec);
         saveRecording(s, blob, Date.now() - recStart, source, s.rec);
       }
       markBtn(s, 'rec', false, 'rec'); recBtn() && (recBtn().textContent = '● 录');
       setStatus(s, s.rec ? '已录音' : ''); refreshSentUI(s);
-      recorder = null; res();
+      if (recorder === rec) recorder = null;
+      res();
     };
   });
-  recorder.start();
+  rec.start();
   markBtn(s, 'rec', true, 'rec'); recBtn() && (recBtn().textContent = '■ 停');
-  setStatus(s, '录音中…');
-  recTimer = setTimeout(() => recorder && recorder.state === 'recording' && recorder.stop(), maxMs);
+  setStatus(s, '准备麦克风…');
+  // 等录音器真正开始、麦克风送出声音后再留 0.3 秒余量，才提示开口；之前的等待只会在开头多一点静音
+  await new Promise((r) => { if (rec.state === 'recording') r(); else { rec.onstart = r; setTimeout(r, 1000); } });
+  await waitMicLive(stream);
+  await new Promise((r) => setTimeout(r, 300));
+  if (rec.state === 'recording') {
+    setStatus(s, '🎙 请开始说');
+    recTimer = setTimeout(() => rec.state === 'recording' && rec.stop(), maxMs); // 计时从提示开口算起
+  }
   return stopped;
 }
 async function toggleRecord(s) {
@@ -998,10 +1031,19 @@ function compare(s, recUrl) {
 function shadow(s) {
   return run(async (id) => {
     markBtn(s, 'shadow', true);
-    await playSentence(s, id);
-    setStatus(s, '轮到你了');
-    await sleep(150, id);
-    await startRecording(s, Math.min(estDur(s) * 1.6 + 1500, 30000), 'shadow');
+    // 原音播放期间就打开麦克风，放完能马上开录
+    let pre = null;
+    const micP = openMic().then((st) => { pre = st; return st; });
+    micP.catch(() => {});
+    let used = false;
+    try {
+      await playSentence(s, id);
+      setStatus(s, '轮到你了');
+      const stream = await micP;
+      if (id !== runId) return;
+      used = true;
+      await startRecording(s, Math.min(estDur(s) * 1.6 + 1500, 30000), 'shadow', stream);
+    } finally { if (!used) { micP.then(releaseMic, () => {}); if (pre) releaseMic(pre); } }
     if (id !== runId) return;
     await sleep(300, id);
     await playSentence(s, id);
